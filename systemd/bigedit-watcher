@@ -77,7 +77,12 @@ stop_mount() {
         log "Stopping FUSE mount for: $original_file (PID $pid)"
         kill -TERM "$pid" 2>/dev/null || true
         sleep 0.5
-        fusermount3 -u "$mount_point" 2>/dev/null || true
+        # Cross-platform unmount
+        if [ "$(uname)" = "Darwin" ]; then
+            umount "$mount_point" 2>/dev/null || true
+        else
+            fusermount3 -u "$mount_point" 2>/dev/null || fusermount -u "$mount_point" 2>/dev/null || true
+        fi
         rm -f "$pid_file"
         rm -f "$symlink" 2>/dev/null || true
         rmdir "$mount_point" 2>/dev/null || true

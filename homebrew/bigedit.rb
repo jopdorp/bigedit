@@ -34,6 +34,10 @@ class Bigedit < Formula
         system "cargo", "install", *std_cargo_args
         system "cargo", "build", "--release", "--bin", "bigedit-fuse"
         bin.install "target/release/bigedit-fuse"
+        
+        # Install watcher script and launchd plist
+        bin.install "systemd/bigedit-watcher"
+        prefix.install "launchd/com.bigedit.watcher.plist"
       else
         # No macFUSE, build without FUSE
         system "cargo", "install", *std_cargo_args, "--no-default-features"
@@ -79,6 +83,14 @@ class Bigedit < Formula
           Ctrl+T  Toggle FUSE mode
 
         FUSE support is enabled! Other programs can see your edits in real-time.
+
+        To auto-mount FUSE views at startup (persists after reboot):
+          mkdir -p ~/Library/LaunchAgents
+          cp #{opt_prefix}/com.bigedit.watcher.plist ~/Library/LaunchAgents/
+          launchctl load ~/Library/LaunchAgents/com.bigedit.watcher.plist
+
+        To stop the watcher:
+          launchctl unload ~/Library/LaunchAgents/com.bigedit.watcher.plist
       EOS
     end
   end
