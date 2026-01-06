@@ -1,7 +1,7 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: bigedit
 Upstream-Contact: BigEdit Contributors <bigedit@example.com>
-Source: https://github.com/jopdorp/largedit
+Source: https://github.com/jopdorp/bigedit
 
 Files: *
 Copyright: 2024-2026 BigEdit Contributors

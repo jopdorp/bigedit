@@ -20,7 +20,7 @@
 
 ```bash
 # Add the repository
-echo "deb [trusted=yes] https://jopdorp.github.io/largedit/apt-repo stable main" | sudo tee /etc/apt/sources.list.d/bigedit.list
+echo "deb [trusted=yes] https://jopdorp.github.io/bigedit/apt-repo stable main" | sudo tee /etc/apt/sources.list.d/bigedit.list
 
 # Update and install
 sudo apt update
@@ -34,8 +34,8 @@ systemctl --user enable --now bigedit-watcher.service
 
 ```bash
 # Clone the repository
-git clone https://github.com/jopdorp/largedit.git
-cd largedit
+git clone https://github.com/jopdorp/bigedit.git
+cd bigedit
 
 # Install with systemd service (default)
 ./install.sh

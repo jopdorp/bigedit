@@ -4,9 +4,9 @@ Priority: optional
 Maintainer: BigEdit Contributors <bigedit@example.com>
 Build-Depends: debhelper-compat (= 13), cargo, rustc, libfuse3-dev, pkg-config
 Standards-Version: 4.6.0
-Homepage: https://github.com/jopdorp/largedit
-Vcs-Browser: https://github.com/jopdorp/largedit
-Vcs-Git: https://github.com/jopdorp/largedit.git
+Homepage: https://github.com/jopdorp/bigedit
+Vcs-Browser: https://github.com/jopdorp/bigedit
+Vcs-Git: https://github.com/jopdorp/bigedit.git
 Rules-Requires-Root: no
 
 Package: bigedit
