@@ -321,7 +321,7 @@ jobs:
           EOF
       
       - name: Publish to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v4
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
         with:
           pkgname: bigedit
           pkgbuild: aur-pkg/PKGBUILD
