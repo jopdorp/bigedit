@@ -332,3 +332,44 @@ jobs:
           assets: |
             aur-pkg/bigedit.install
             aur-pkg/.SRCINFO
+
+  publish-homebrew:
+    needs: create-release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Calculate source tarball checksum
+        id: checksum
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          curl -sL "https://github.com/jopdorp/bigedit/archive/refs/tags/v${VERSION}.tar.gz" -o source.tar.gz
+          SHA256=$(sha256sum source.tar.gz | cut -d' ' -f1)
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Update Homebrew formula
+        run: |
+          VERSION=${{ steps.checksum.outputs.version }}
+          SHA256=${{ steps.checksum.outputs.sha256 }}
+          
+          # Update the formula with the new version and checksum
+          mkdir -p homebrew-tap/Formula
+          sed "s|url \"https://github.com/jopdorp/bigedit/archive/refs/tags/v.*\.tar\.gz\"|url \"https://github.com/jopdorp/bigedit/archive/refs/tags/v${VERSION}.tar.gz\"|" homebrew/bigedit.rb > homebrew-tap/Formula/bigedit.rb
+          sed -i "s/sha256 \".*\"/sha256 \"${SHA256}\"/" homebrew-tap/Formula/bigedit.rb
+      
+      - name: Push to homebrew-bigedit tap
+        uses: cpina/github-action-push-to-another-repository@main
+        env:
+          SSH_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        with:
+          source-directory: 'homebrew-tap/Formula'
+          destination-github-username: 'jopdorp'
+          destination-repository-name: 'homebrew-bigedit'
+          target-directory: 'Formula'
+          user-email: ${{ secrets.GIT_EMAIL }}
+          user-name: 'GitHub Actions'
+          target-branch: main
+          commit-message: "Update bigedit to ${{ steps.checksum.outputs.version }}"
