@@ -1,0 +1,33 @@
+[package]
+name = "bigedit"
+version = "0.1.0"
+edition = "2021"
+description = "A streaming TUI editor for very large files"
+authors = ["bigedit contributors"]
+
+[dependencies]
+# TUI framework
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Fast searching
+memchr = "2.7"
+
+# Unicode handling
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Safe temp file creation
+tempfile = "3.14"
+
+# System calls for high-performance I/O (Linux)
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
