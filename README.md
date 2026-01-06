@@ -20,7 +20,7 @@
 
 ```bash
 # Add the repository
-echo "deb [trusted=yes] https://jopdorp.github.io/bigedit/apt-repo stable main" | sudo tee /etc/apt/sources.list.d/bigedit.list
+echo "deb [trusted=yes arch=amd64] https://jopdorp.github.io/bigedit stable main" | sudo tee /etc/apt/sources.list.d/bigedit.list
 
 # Update and install
 sudo apt update
