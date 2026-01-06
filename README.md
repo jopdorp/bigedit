@@ -49,14 +49,14 @@ The bigedit-watcher service is enabled by default. To start it immediately:
 systemctl --user daemon-reload && systemctl --user start bigedit-watcher.service
 ```
 
-### macOS (Homebrew)
+### macOS / Linux (Homebrew)
 
 ```bash
 brew tap jopdorp/bigedit
 brew install bigedit
 ```
 
-> **Note:** macOS requires [macFUSE](https://osxfuse.github.io/) for FUSE features.
+> **Note:** macOS requires [macFUSE](https://osxfuse.github.io/) for FUSE features. On Linux, Homebrew will install libfuse. For Linux, native package managers (APT/AUR) are recommended as they're lighter weight.
 
 ### From Source
 

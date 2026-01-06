@@ -7,7 +7,15 @@ class Bigedit < Formula
   head "https://github.com/jopdorp/bigedit.git", branch: "master"
 
   depends_on "rust" => :build
-  depends_on "macfuse"
+  depends_on "pkg-config" => :build
+
+  on_macos do
+    depends_on "macfuse"
+  end
+
+  on_linux do
+    depends_on "libfuse"
+  end
 
   def install
     system "cargo", "install", *std_cargo_args
@@ -18,12 +26,15 @@ class Bigedit < Formula
   end
 
   def caveats
+    on_macos do
+      <<~EOS
+        bigedit requires macFUSE to be installed for the FUSE features to work.
+        
+        After installing macFUSE, you may need to allow its kernel extension
+        in System Preferences > Security & Privacy > Privacy & Security.
+      EOS
+    end
     <<~EOS
-      bigedit requires macFUSE to be installed for the FUSE features to work.
-      
-      After installing macFUSE, you may need to allow its kernel extension
-      in System Preferences > Security & Privacy > Privacy & Security.
-      
       Usage:
         bigedit <filename>
       
