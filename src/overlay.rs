@@ -449,19 +449,19 @@ impl SaveStrategy {
     pub fn next(&self) -> Self {
         match self {
             SaveStrategy::Journal => {
+                #[cfg(feature = "fuse")]
                 if crate::fuse_view::is_fuse_available() {
-                    SaveStrategy::FuseView
-                } else {
-                    SaveStrategy::Journal
+                    return SaveStrategy::FuseView;
                 }
+                SaveStrategy::Journal
             }
             SaveStrategy::FuseView => SaveStrategy::Journal,
             SaveStrategy::Reflink => {
+                #[cfg(feature = "fuse")]
                 if crate::fuse_view::is_fuse_available() {
-                    SaveStrategy::FuseView
-                } else {
-                    SaveStrategy::Journal
+                    return SaveStrategy::FuseView;
                 }
+                SaveStrategy::Journal
             }
             SaveStrategy::Overlay => SaveStrategy::Journal,
         }

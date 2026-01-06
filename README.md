@@ -58,7 +58,12 @@ brew tap jopdorp/bigedit
 brew install bigedit
 ```
 
-> **Note:** macOS requires [macFUSE](https://osxfuse.github.io/) for FUSE features. On Linux, Homebrew will install libfuse. For Linux, native package managers (APT/AUR) are recommended as they're lighter weight.
+> **Note:** On macOS, bigedit works without FUSE for basic editing. For FUSE features (virtual file view for other programs), install [macFUSE](https://osxfuse.github.io/) first:
+> ```bash
+> brew install --cask macfuse
+> # Allow the kernel extension in System Settings > Privacy & Security
+> brew reinstall bigedit
+> ```
 
 ### From Source
 
@@ -73,6 +78,9 @@ cd bigedit
 # Or install without systemd service
 ./install.sh --no-systemd
 
+# Build without FUSE (if libfuse/macFUSE not available)
+cargo install --path . --no-default-features
+
 # To uninstall
 ./install.sh --uninstall
 ```
@@ -80,7 +88,7 @@ cd bigedit
 ### Build Dependencies
 
 - Rust 1.70+
-- libfuse3-dev (Linux) or macFUSE (macOS)
+- libfuse3-dev (Linux) or macFUSE (macOS) - *optional for FUSE features*
 - pkg-config
 
 ```bash
@@ -93,7 +101,7 @@ sudo dnf install fuse3-devel pkg-config fuse3 inotify-tools
 # Arch
 sudo pacman -S fuse3 pkg-config inotify-tools
 
-# macOS
+# macOS (optional, for FUSE features)
 brew install --cask macfuse
 ```
 

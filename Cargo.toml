@@ -5,6 +5,10 @@ edition = "2021"
 description = "A streaming TUI editor for very large files"
 authors = ["bigedit contributors"]
 
+[features]
+default = ["fuse"]
+fuse = ["dep:fuser", "dep:ctrlc"]
+
 [[bin]]
 name = "bigedit"
 path = "src/main.rs"
@@ -12,6 +16,7 @@ path = "src/main.rs"
 [[bin]]
 name = "bigedit-fuse"
 path = "src/bin/fuse_daemon.rs"
+required-features = ["fuse"]
 
 [dependencies]
 # TUI framework
@@ -32,11 +37,11 @@ thiserror = "2.0"
 # Safe temp file creation
 tempfile = "3.14"
 
-# FUSE filesystem for virtual patched file view
-fuser = "0.14"
+# FUSE filesystem for virtual patched file view (optional)
+fuser = { version = "0.14", optional = true }
 
-# Signal handling for FUSE daemon
-ctrlc = "3.4"
+# Signal handling for FUSE daemon (optional)
+ctrlc = { version = "3.4", optional = true }
 
 # System calls for high-performance I/O (Linux)
 [target.'cfg(target_os = "linux")'.dependencies]

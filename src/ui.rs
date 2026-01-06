@@ -3,6 +3,7 @@
 //! This module provides a nano-like interface using ratatui and crossterm.
 
 use crate::editor::Editor;
+#[cfg(feature = "fuse")]
 use crate::fuse_view::FuseMount;
 use crate::journal;
 use crate::overlay::{SaveStrategy, OverlaySession, ReflinkSession};
@@ -120,6 +121,7 @@ pub struct App {
     /// Active reflink session (if using reflink strategy)
     reflink_session: Option<ReflinkSession>,
     /// Active FUSE mount (if using FuseView strategy)
+    #[cfg(feature = "fuse")]
     fuse_mount: Option<FuseMount>,
 }
 
@@ -134,7 +136,15 @@ impl App {
         let terminal = Terminal::new(backend)?;
 
         // Detect best save strategy
-        let save_strategy = SaveStrategy::detect(path);
+        let mut save_strategy = SaveStrategy::detect(path);
+        
+        // If FUSE is not compiled in, fall back to Journal mode
+        #[cfg(not(feature = "fuse"))]
+        {
+            if save_strategy == SaveStrategy::FuseView {
+                save_strategy = SaveStrategy::Journal;
+            }
+        }
 
         // Open editor
         let mut editor = if path.exists() {
@@ -144,7 +154,10 @@ impl App {
         };
 
         // Show detected strategy
+        #[cfg(feature = "fuse")]
         editor.set_status(format!("Mode: {} | ^T=toggle mode, ^J=write to file", save_strategy.description()));
+        #[cfg(not(feature = "fuse"))]
+        editor.set_status("Mode: Journal | ^J=write to file (FUSE not available)");
 
         Ok(Self {
             editor,
@@ -153,6 +166,7 @@ impl App {
             save_strategy,
             overlay_session: None,
             reflink_session: None,
+            #[cfg(feature = "fuse")]
             fuse_mount: None,
         })
     }
@@ -744,6 +758,7 @@ impl App {
         let start = std::time::Instant::now();
         
         match self.save_strategy {
+            #[cfg(feature = "fuse")]
             SaveStrategy::FuseView => {
                 // Save to journal first
                 journal::save_to_journal(&self.editor.path, &self.editor.patches)?;
@@ -763,6 +778,11 @@ impl App {
                 
                 // The FUSE daemon reads patches directly from the journal file,
                 // so no need to update it here - it will pick up changes on next read
+            }
+            #[cfg(not(feature = "fuse"))]
+            SaveStrategy::FuseView => {
+                // FUSE not available, fall back to journal
+                journal::save_to_journal(&self.editor.path, &self.editor.patches)?;
             }
             SaveStrategy::Overlay => {
                 // Initialize overlay session if needed
@@ -861,6 +881,7 @@ impl App {
         self.reflink_session = None;
 
         // Clean up FUSE mount (will be recreated on next save in FUSE mode)
+        #[cfg(feature = "fuse")]
         if let Some(mount) = self.fuse_mount.take() {
             let _ = mount.unmount();
         }
@@ -887,43 +908,53 @@ impl App {
 
     /// Toggle between save modes (Journal <-> FuseView)
     fn toggle_save_mode(&mut self) -> Result<()> {
-        let old_strategy = self.save_strategy;
-        let new_strategy = self.save_strategy.next();
-
-        // If switching away from FuseView, unmount
-        if old_strategy == SaveStrategy::FuseView && new_strategy != SaveStrategy::FuseView {
-            if let Some(mount) = self.fuse_mount.take() {
-                let _ = mount.unmount();
-            }
+        #[cfg(not(feature = "fuse"))]
+        {
+            // FUSE not available, show message
+            self.editor.set_status("FUSE mode not available. Install macFUSE (macOS) or libfuse (Linux) and rebuild with 'fuse' feature.");
+            return Ok(());
         }
+        
+        #[cfg(feature = "fuse")]
+        {
+            let old_strategy = self.save_strategy;
+            let new_strategy = self.save_strategy.next();
 
-        // If switching to FuseView, mount
-        if new_strategy == SaveStrategy::FuseView && old_strategy != SaveStrategy::FuseView {
-            match FuseMount::new(&self.editor.path) {
-                Ok(mount) => {
-                    let view_path = mount.virtual_path().display().to_string();
-                    self.fuse_mount = Some(mount);
-                    self.save_strategy = new_strategy;
-                    self.editor.set_status(format!(
-                        "Mode: {} | View at: {}",
-                        new_strategy.description(),
-                        view_path
-                    ));
-                    return Ok(());
-                }
-                Err(e) => {
-                    self.editor.set_status(format!("FUSE mount failed: {} - staying in Journal mode", e));
-                    return Ok(());
+            // If switching away from FuseView, unmount
+            if old_strategy == SaveStrategy::FuseView && new_strategy != SaveStrategy::FuseView {
+                if let Some(mount) = self.fuse_mount.take() {
+                    let _ = mount.unmount();
                 }
             }
-        }
 
-        self.save_strategy = new_strategy;
-        self.editor.set_status(format!(
-            "Mode: {} | ^T=toggle, ^J=write to file",
-            new_strategy.description()
-        ));
-        Ok(())
+            // If switching to FuseView, mount
+            if new_strategy == SaveStrategy::FuseView && old_strategy != SaveStrategy::FuseView {
+                match FuseMount::new(&self.editor.path) {
+                    Ok(mount) => {
+                        let view_path = mount.virtual_path().display().to_string();
+                        self.fuse_mount = Some(mount);
+                        self.save_strategy = new_strategy;
+                        self.editor.set_status(format!(
+                            "Mode: {} | View at: {}",
+                            new_strategy.description(),
+                            view_path
+                        ));
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        self.editor.set_status(format!("FUSE mount failed: {} - staying in Journal mode", e));
+                        return Ok(());
+                    }
+                }
+            }
+
+            self.save_strategy = new_strategy;
+            self.editor.set_status(format!(
+                "Mode: {} | ^T=toggle, ^J=write to file",
+                new_strategy.description()
+            ));
+            Ok(())
+        }
     }
 
     /// Find next occurrence of search pattern
