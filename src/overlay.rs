@@ -424,32 +424,66 @@ impl Drop for ReflinkSession {
 /// Determine the best available save strategy
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SaveStrategy {
-    /// Use OverlayFS (best: true copy-on-write at kernel level)
+    /// Use FUSE virtual file (exposes patched view to other programs)
+    FuseView,
+    /// Use OverlayFS (true copy-on-write at kernel level) - NOT IMPLEMENTED
     Overlay,
-    /// Use reflinks (good: instant copy, CoW at filesystem level)
+    /// Use reflinks (instant copy, CoW at filesystem level)
     Reflink,
-    /// Use journal (fallback: patch-based, works everywhere)
+    /// Use journal only (patch-based, works everywhere, but other programs see original)
     Journal,
 }
 
 impl SaveStrategy {
     /// Detect the best available strategy for a given file
     pub fn detect(file_path: &Path) -> Self {
-        if is_available() {
-            SaveStrategy::Overlay
-        } else if ReflinkSession::is_available(file_path) {
+        // Default to Journal - user can switch to FuseView with Ctrl+M
+        if ReflinkSession::is_available(file_path) {
             SaveStrategy::Reflink
         } else {
             SaveStrategy::Journal
         }
     }
 
-    /// Get a description of the strategy
+    /// Get the next strategy in cycle (for mode switching)
+    pub fn next(&self) -> Self {
+        match self {
+            SaveStrategy::Journal => {
+                if crate::fuse_view::is_fuse_available() {
+                    SaveStrategy::FuseView
+                } else {
+                    SaveStrategy::Journal
+                }
+            }
+            SaveStrategy::FuseView => SaveStrategy::Journal,
+            SaveStrategy::Reflink => {
+                if crate::fuse_view::is_fuse_available() {
+                    SaveStrategy::FuseView
+                } else {
+                    SaveStrategy::Journal
+                }
+            }
+            SaveStrategy::Overlay => SaveStrategy::Journal,
+        }
+    }
+
+    /// Get a short description of the strategy
     pub fn description(&self) -> &'static str {
         match self {
+            SaveStrategy::FuseView => "FUSE (virtual view)",
             SaveStrategy::Overlay => "OverlayFS (kernel CoW)",
             SaveStrategy::Reflink => "Reflink (filesystem CoW)", 
-            SaveStrategy::Journal => "Journal (patch-based)",
+            SaveStrategy::Journal => "Journal only",
+        }
+    }
+
+    /// Get a longer description with behavior explanation
+    pub fn long_description(&self) -> &'static str {
+        match self {
+            SaveStrategy::FuseView => "FUSE: Other programs can read patched file via .filename.view/",
+            SaveStrategy::Overlay => "OverlayFS: Kernel-level copy-on-write",
+            SaveStrategy::Reflink => "Reflink: Filesystem copy-on-write", 
+            SaveStrategy::Journal => "Journal: Saves to .filename.bigedit-journal (^J to write original)",
         }
     }
 }

@@ -4,6 +4,7 @@
 //! into memory. It uses a viewport + patch list + streaming save approach.
 
 mod editor;
+mod fuse_view;
 mod journal;
 mod overlay;
 mod patches;

@@ -1,0 +1,14 @@
+[Unit]
+Description=BigEdit FUSE Watcher - Auto-mount patched file views
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bigedit-watcher
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=BigEdit FUSE mount for %I
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bigedit-fuse %I
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

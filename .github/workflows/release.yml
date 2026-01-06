@@ -1,0 +1,233 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64]
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+      
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            debhelper \
+            devscripts \
+            libfuse3-dev \
+            pkg-config \
+            fakeroot \
+            dpkg-dev
+      
+      - name: Build Debian package
+        run: |
+          # Build release binaries
+          cargo build --release
+          
+          # Create package directory structure
+          PKG_DIR="bigedit_0.1.0-1_${{ matrix.arch }}"
+          mkdir -p "$PKG_DIR/DEBIAN"
+          mkdir -p "$PKG_DIR/usr/bin"
+          mkdir -p "$PKG_DIR/usr/lib/systemd/user"
+          
+          # Copy binaries
+          cp target/release/bigedit "$PKG_DIR/usr/bin/"
+          cp target/release/bigedit-fuse "$PKG_DIR/usr/bin/"
+          cp systemd/bigedit-watcher "$PKG_DIR/usr/bin/"
+          chmod 755 "$PKG_DIR/usr/bin/"*
+          
+          # Copy systemd services
+          cp systemd/bigedit-watcher.service "$PKG_DIR/usr/lib/systemd/user/"
+          cp systemd/bigedit-fuse@.service "$PKG_DIR/usr/lib/systemd/user/"
+          
+          # Create control file
+          cat > "$PKG_DIR/DEBIAN/control" << 'EOF'
+          Package: bigedit
+          Version: 0.1.0-1
+          Section: editors
+          Priority: optional
+          Architecture: ${{ matrix.arch }}
+          Depends: fuse3
+          Recommends: inotify-tools
+          Maintainer: BigEdit Contributors <bigedit@example.com>
+          Description: Streaming TUI editor for very large files
+           BigEdit is a terminal-based text editor designed to handle multi-gigabyte
+           files efficiently. It uses streaming I/O and patch-based editing to avoid
+           loading entire files into memory.
+          EOF
+          
+          # Copy maintainer scripts
+          cp debian/postinst "$PKG_DIR/DEBIAN/"
+          cp debian/prerm "$PKG_DIR/DEBIAN/"
+          chmod 755 "$PKG_DIR/DEBIAN/postinst" "$PKG_DIR/DEBIAN/prerm"
+          
+          # Build the package
+          fakeroot dpkg-deb --build "$PKG_DIR"
+          
+          # Verify
+          dpkg-deb --info "${PKG_DIR}.deb"
+      
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bigedit-deb-${{ matrix.arch }}
+          path: "*.deb"
+
+  publish-apt-repo:
+    needs: build-deb
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download all deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: debs
+          pattern: bigedit-deb-*
+          merge-multiple: true
+      
+      - name: Setup APT repository
+        run: |
+          mkdir -p apt-repo/pool/main
+          mkdir -p apt-repo/dists/stable/main/binary-amd64
+          
+          # Copy debs to pool
+          cp debs/*.deb apt-repo/pool/main/
+          
+          # Generate Packages file
+          cd apt-repo
+          dpkg-scanpackages pool/main > dists/stable/main/binary-amd64/Packages
+          gzip -k dists/stable/main/binary-amd64/Packages
+          
+          # Generate Release file
+          cat > dists/stable/Release << EOF
+          Origin: BigEdit
+          Label: BigEdit
+          Suite: stable
+          Codename: stable
+          Architectures: amd64
+          Components: main
+          Description: BigEdit APT Repository
+          EOF
+          
+          # Add checksums
+          cd dists/stable
+          echo "MD5Sum:" >> Release
+          for f in main/binary-amd64/Packages*; do
+            echo " $(md5sum $f | cut -d' ' -f1) $(wc -c < $f) $f" >> Release
+          done
+          echo "SHA256:" >> Release
+          for f in main/binary-amd64/Packages*; do
+            echo " $(sha256sum $f | cut -d' ' -f1) $(wc -c < $f) $f" >> Release
+          done
+      
+      - name: Create index.html
+        run: |
+          cat > apt-repo/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>BigEdit APT Repository</title>
+              <style>
+                  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+                  pre { background: #f4f4f4; padding: 15px; border-radius: 5px; overflow-x: auto; }
+                  code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
+                  h1 { color: #333; }
+                  .warning { background: #fff3cd; border: 1px solid #ffc107; padding: 10px; border-radius: 5px; margin: 10px 0; }
+              </style>
+          </head>
+          <body>
+              <h1>🖥️ BigEdit APT Repository</h1>
+              
+              <p>BigEdit is a streaming TUI editor for very large files. Edit multi-gigabyte files without loading them into memory!</p>
+              
+              <h2>Installation</h2>
+              
+              <h3>Quick Install (Ubuntu/Debian)</h3>
+              <pre>
+          # Add the repository
+          echo "deb [trusted=yes] https://jopdorp.github.io/largedit/apt-repo stable main" | sudo tee /etc/apt/sources.list.d/bigedit.list
+          
+          # Update and install
+          sudo apt update
+          sudo apt install bigedit
+              </pre>
+              
+              <h3>Enable Auto-Mount Service</h3>
+              <pre>
+          # Enable the FUSE watcher to auto-mount patched file views
+          systemctl --user enable --now bigedit-watcher.service
+              </pre>
+              
+              <h2>Usage</h2>
+              <pre>
+          bigedit &lt;filename&gt;
+              </pre>
+              
+              <h3>Keybindings</h3>
+              <ul>
+                  <li><code>Ctrl+O</code> - Save (journal mode, instant)</li>
+                  <li><code>Ctrl+J</code> - Compact (full file rewrite)</li>
+                  <li><code>Ctrl+T</code> - Toggle FUSE mode</li>
+                  <li><code>Ctrl+X</code> - Exit</li>
+                  <li><code>Ctrl+G</code> - Help</li>
+              </ul>
+              
+              <h2>Features</h2>
+              <ul>
+                  <li>Edit files larger than RAM</li>
+                  <li>Nano-like keybindings</li>
+                  <li>FUSE virtual filesystem - other programs can see your changes</li>
+                  <li>Journal-based saves for instant writes</li>
+                  <li>Systemd service for auto-mounting on boot</li>
+              </ul>
+              
+              <h2>Source Code</h2>
+              <p><a href="https://github.com/jopdorp/largedit">https://github.com/jopdorp/largedit</a></p>
+          </body>
+          </html>
+          EOF
+      
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: apt-repo
+      
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
+
+  create-release:
+    needs: build-deb
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Download all deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: debs
+          pattern: bigedit-deb-*
+          merge-multiple: true
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: debs/*.deb
+          generate_release_notes: true

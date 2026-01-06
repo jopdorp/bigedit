@@ -1,0 +1,63 @@
+#!/bin/bash
+# postinst script for bigedit
+
+set -e
+
+ENABLE_SYSTEMD="${BIGEDIT_ENABLE_SYSTEMD:-yes}"
+
+case "$1" in
+    configure)
+        # Notify user about systemd service
+        echo ""
+        echo "╔══════════════════════════════════════════════════════════════════╗"
+        echo "║                    BigEdit Installation Complete                  ║"
+        echo "╠══════════════════════════════════════════════════════════════════╣"
+        echo "║                                                                   ║"
+        echo "║  BigEdit includes a systemd user service that automatically      ║"
+        echo "║  mounts FUSE views for files being edited, so other programs     ║"
+        echo "║  can see your changes even before you write them to disk.        ║"
+        echo "║                                                                   ║"
+        echo "╚══════════════════════════════════════════════════════════════════╝"
+        echo ""
+        
+        if [ "$ENABLE_SYSTEMD" = "yes" ]; then
+            echo "To enable the auto-mount service for your user, run:"
+            echo ""
+            echo "    systemctl --user enable --now bigedit-watcher.service"
+            echo ""
+            echo "To disable it later:"
+            echo ""
+            echo "    systemctl --user disable --now bigedit-watcher.service"
+            echo ""
+        else
+            echo "Systemd service installation was skipped."
+            echo "To enable it manually later, run:"
+            echo ""
+            echo "    systemctl --user enable --now bigedit-watcher.service"
+            echo ""
+        fi
+        
+        echo "Usage:"
+        echo "    bigedit <filename>     Edit a file"
+        echo ""
+        echo "Keybindings:"
+        echo "    Ctrl+O     Save (journal mode)"
+        echo "    Ctrl+J     Compact (full file rewrite)"
+        echo "    Ctrl+T     Toggle FUSE mode"
+        echo "    Ctrl+X     Exit"
+        echo "    Ctrl+G     Help"
+        echo ""
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

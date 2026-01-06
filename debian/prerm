@@ -1,0 +1,27 @@
+#!/bin/bash
+# prerm script for bigedit
+
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        # Stop the watcher service for all users if running
+        # Note: This only affects the current user since it's a user service
+        if systemctl --user is-active bigedit-watcher.service >/dev/null 2>&1; then
+            echo "Stopping bigedit-watcher service..."
+            systemctl --user stop bigedit-watcher.service || true
+        fi
+        ;;
+
+    failed-upgrade)
+        ;;
+
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

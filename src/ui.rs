@@ -3,6 +3,7 @@
 //! This module provides a nano-like interface using ratatui and crossterm.
 
 use crate::editor::Editor;
+use crate::fuse_view::FuseMount;
 use crate::journal;
 use crate::overlay::{SaveStrategy, OverlaySession, ReflinkSession};
 use crate::save::save_file;
@@ -45,6 +46,7 @@ File Operations:
   Ctrl+O        Write Out (instant save to journal)
   Ctrl+S        Save (same as Ctrl+O)
   Ctrl+J        Compact (full file rewrite, slow)
+  Ctrl+T        Toggle save mode (Journal / FUSE)
   Ctrl+X        Exit
 
 Search:
@@ -57,11 +59,16 @@ Help:
   Esc           Cancel/close prompt
 
 SAVE MODES:
-  Normal save (Ctrl+O/S) writes patches to a journal file
-  for near-instant saves. The original file is unchanged.
-  
-  Compact (Ctrl+J) rewrites the entire file with all patches
-  applied. This is slow for large files but cleans up the journal.
+
+  Journal Mode (default):
+    Saves patches to .filename.bigedit-journal
+    Original file unchanged - other programs see old content
+    Use Ctrl+J to write changes to original file
+
+  FUSE Mode:
+    Mounts a virtual view at .filename.view/filename
+    Other programs (less, cat, etc.) can read patched content
+    Original file still unchanged until Ctrl+J
 
 Press any key to close this help...
 "#;
@@ -71,12 +78,14 @@ pub struct App {
     pub editor: Editor,
     terminal: Terminal<CrosstermBackend<Stdout>>,
     should_quit: bool,
-    /// The detected save strategy
+    /// The current save strategy
     save_strategy: SaveStrategy,
     /// Active overlay session (if using overlay strategy)
     overlay_session: Option<OverlaySession>,
     /// Active reflink session (if using reflink strategy)
     reflink_session: Option<ReflinkSession>,
+    /// Active FUSE mount (if using FuseView strategy)
+    fuse_mount: Option<FuseMount>,
 }
 
 impl App {
@@ -100,7 +109,7 @@ impl App {
         };
 
         // Show detected strategy
-        editor.set_status(format!("Save mode: {}", save_strategy.description()));
+        editor.set_status(format!("Mode: {} | ^T=toggle mode, ^J=write to file", save_strategy.description()));
 
         Ok(Self {
             editor,
@@ -109,6 +118,7 @@ impl App {
             save_strategy,
             overlay_session: None,
             reflink_session: None,
+            fuse_mount: None,
         })
     }
 
@@ -124,6 +134,7 @@ impl App {
     /// Draw the UI
     fn draw(&mut self) -> Result<()> {
         let editor = &self.editor;
+        let save_strategy = self.save_strategy;
 
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -145,7 +156,7 @@ impl App {
             draw_status_bar(frame, editor, chunks[1]);
 
             // Draw help/mode bar
-            draw_help_bar(frame, editor, chunks[2]);
+            draw_help_bar(frame, editor, save_strategy, chunks[2]);
 
             // Draw cursor
             let visible_row = editor.cursor.row.saturating_sub(editor.scroll_offset);
@@ -231,6 +242,11 @@ impl App {
             (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
                 self.editor.set_status("Compacting (full file rewrite)...");
                 self.compact_file()?;
+            }
+
+            // Toggle save mode
+            (KeyModifiers::CONTROL, KeyCode::Char('t')) => {
+                self.toggle_save_mode()?;
             }
 
             // Cut line
@@ -400,6 +416,26 @@ impl App {
         let start = std::time::Instant::now();
         
         match self.save_strategy {
+            SaveStrategy::FuseView => {
+                // Save to journal first
+                journal::save_to_journal(&self.editor.path, &self.editor.patches)?;
+                
+                // Create FUSE mount if it doesn't exist yet
+                if self.fuse_mount.is_none() {
+                    match FuseMount::new(&self.editor.path) {
+                        Ok(mount) => {
+                            self.fuse_mount = Some(mount);
+                        }
+                        Err(e) => {
+                            // Report error but continue with journal save
+                            self.editor.set_status(format!("FUSE mount failed: {}", e));
+                        }
+                    }
+                }
+                
+                // The FUSE daemon reads patches directly from the journal file,
+                // so no need to update it here - it will pick up changes on next read
+            }
             SaveStrategy::Overlay => {
                 // Initialize overlay session if needed
                 if self.overlay_session.is_none() {
@@ -495,6 +531,11 @@ impl App {
             let _ = session.discard();
         }
         self.reflink_session = None;
+
+        // Clean up FUSE mount (will be recreated on next save in FUSE mode)
+        if let Some(mount) = self.fuse_mount.take() {
+            let _ = mount.unmount();
+        }
         
         let elapsed = start.elapsed();
         let file_size = std::fs::metadata(&self.editor.path)?.len();
@@ -512,6 +553,47 @@ impl App {
             "Compacted {} in {:.1}s",
             format_size(file_size),
             elapsed.as_secs_f64()
+        ));
+        Ok(())
+    }
+
+    /// Toggle between save modes (Journal <-> FuseView)
+    fn toggle_save_mode(&mut self) -> Result<()> {
+        let old_strategy = self.save_strategy;
+        let new_strategy = self.save_strategy.next();
+
+        // If switching away from FuseView, unmount
+        if old_strategy == SaveStrategy::FuseView && new_strategy != SaveStrategy::FuseView {
+            if let Some(mount) = self.fuse_mount.take() {
+                let _ = mount.unmount();
+            }
+        }
+
+        // If switching to FuseView, mount
+        if new_strategy == SaveStrategy::FuseView && old_strategy != SaveStrategy::FuseView {
+            match FuseMount::new(&self.editor.path) {
+                Ok(mount) => {
+                    let view_path = mount.virtual_path().display().to_string();
+                    self.fuse_mount = Some(mount);
+                    self.save_strategy = new_strategy;
+                    self.editor.set_status(format!(
+                        "Mode: {} | View at: {}",
+                        new_strategy.description(),
+                        view_path
+                    ));
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.editor.set_status(format!("FUSE mount failed: {} - staying in Journal mode", e));
+                    return Ok(());
+                }
+            }
+        }
+
+        self.save_strategy = new_strategy;
+        self.editor.set_status(format!(
+            "Mode: {} | ^T=toggle, ^J=write to file",
+            new_strategy.description()
         ));
         Ok(())
     }
@@ -674,7 +756,7 @@ fn draw_status_bar(frame: &mut ratatui::Frame, editor: &Editor, area: Rect) {
 }
 
 /// Draw the help/shortcut bar
-fn draw_help_bar(frame: &mut ratatui::Frame, editor: &Editor, area: Rect) {
+fn draw_help_bar(frame: &mut ratatui::Frame, editor: &Editor, save_strategy: SaveStrategy, area: Rect) {
     let shortcuts = match editor.mode {
         EditorMode::Search => vec![
             ("Enter", "Search"),
@@ -686,11 +768,11 @@ fn draw_help_bar(frame: &mut ratatui::Frame, editor: &Editor, area: Rect) {
             ("C", "Cancel"),
         ],
         _ => vec![
-            ("^G", "Help"),
-            ("^O", "Write"),
+            ("^O", "Save"),
+            ("^J", "WriteFile"),
+            ("^T", "Mode"),
             ("^W", "Search"),
-            ("^K", "Cut"),
-            ("^U", "Paste"),
+            ("^G", "Help"),
             ("^X", "Exit"),
         ],
     };
@@ -711,7 +793,19 @@ fn draw_help_bar(frame: &mut ratatui::Frame, editor: &Editor, area: Rect) {
         })
         .collect();
 
-    let help_bar = Paragraph::new(Line::from(spans))
+    // Add mode indicator at the end
+    let mode_indicator = Span::styled(
+        format!(" [{}] ", save_strategy.description()),
+        Style::default()
+            .fg(Color::Yellow)
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let mut all_spans = spans;
+    all_spans.push(mode_indicator);
+
+    let help_bar = Paragraph::new(Line::from(all_spans))
         .style(Style::default().bg(Color::DarkGray));
 
     frame.render_widget(help_bar, area);

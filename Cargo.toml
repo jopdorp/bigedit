@@ -5,6 +5,14 @@ edition = "2021"
 description = "A streaming TUI editor for very large files"
 authors = ["bigedit contributors"]
 
+[[bin]]
+name = "bigedit"
+path = "src/main.rs"
+
+[[bin]]
+name = "bigedit-fuse"
+path = "src/bin/fuse_daemon.rs"
+
 [dependencies]
 # TUI framework
 ratatui = "0.29"
@@ -23,6 +31,12 @@ thiserror = "2.0"
 
 # Safe temp file creation
 tempfile = "3.14"
+
+# FUSE filesystem for virtual patched file view
+fuser = "0.14"
+
+# Signal handling for FUSE daemon
+ctrlc = "3.4"
 
 # System calls for high-performance I/O (Linux)
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -1,0 +1,8 @@
+bigedit (0.1.0-1) unstable; urgency=medium
+
+  * Initial release
+  * Streaming TUI editor for very large files
+  * FUSE virtual filesystem for viewing patched content
+  * Systemd service for auto-mounting on boot
+
+ -- BigEdit Contributors <bigedit@example.com>  Mon, 06 Jan 2026 17:00:00 +0000

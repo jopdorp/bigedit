@@ -1,0 +1,26 @@
+Source: bigedit
+Section: editors
+Priority: optional
+Maintainer: BigEdit Contributors <bigedit@example.com>
+Build-Depends: debhelper-compat (= 13), cargo, rustc, libfuse3-dev, pkg-config
+Standards-Version: 4.6.0
+Homepage: https://github.com/jopdorp/largedit
+Vcs-Browser: https://github.com/jopdorp/largedit
+Vcs-Git: https://github.com/jopdorp/largedit.git
+Rules-Requires-Root: no
+
+Package: bigedit
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, fuse3
+Recommends: inotify-tools
+Description: Streaming TUI editor for very large files
+ BigEdit is a terminal-based text editor designed to handle multi-gigabyte
+ files efficiently. It uses streaming I/O and patch-based editing to avoid
+ loading entire files into memory.
+ .
+ Features:
+  - Edit files larger than RAM
+  - Nano-like keybindings
+  - FUSE virtual file system for viewing patched content
+  - Journal-based saves for instant writes
+  - Systemd service for auto-mounting patched views on boot
