@@ -16,8 +16,21 @@ class Bigedit < Formula
   def install
     if OS.mac?
       # On macOS, check if macFUSE is installed
-      if File.exist?("/Library/Filesystems/macfuse.fs") || File.exist?("/usr/local/lib/libfuse.dylib")
-        # macFUSE is installed, build with FUSE support
+      macfuse_installed = File.exist?("/Library/Filesystems/macfuse.fs") || 
+                          File.exist?("/usr/local/lib/libfuse.dylib") ||
+                          File.exist?("/opt/homebrew/lib/libfuse.dylib")
+      
+      if macfuse_installed
+        # Set PKG_CONFIG_PATH for macFUSE (supports both Intel and Apple Silicon)
+        fuse_pc_paths = [
+          "/usr/local/lib/pkgconfig",
+          "/opt/homebrew/lib/pkgconfig", 
+          "/Library/Frameworks/macFUSE.framework/Resources/pkgconfig"
+        ].select { |p| Dir.exist?(p) }.join(":")
+        
+        ENV.prepend_path "PKG_CONFIG_PATH", fuse_pc_paths unless fuse_pc_paths.empty?
+        
+        # Build with FUSE support
         system "cargo", "install", *std_cargo_args
         system "cargo", "build", "--release", "--bin", "bigedit-fuse"
         bin.install "target/release/bigedit-fuse"
@@ -34,7 +47,13 @@ class Bigedit < Formula
   end
 
   def caveats
-    if OS.mac? && !File.exist?("/Library/Filesystems/macfuse.fs") && !File.exist?("/usr/local/lib/libfuse.dylib")
+    macfuse_installed = OS.mac? && (
+      File.exist?("/Library/Filesystems/macfuse.fs") || 
+      File.exist?("/usr/local/lib/libfuse.dylib") ||
+      File.exist?("/opt/homebrew/lib/libfuse.dylib")
+    )
+    
+    if OS.mac? && !macfuse_installed
       <<~EOS
         bigedit was installed WITHOUT FUSE support.
         
