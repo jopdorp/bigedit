@@ -557,8 +557,24 @@ pub fn kill_fuse_daemon(file_path: &Path) -> Result<()> {
 
 /// Check if FUSE is available on this system
 pub fn is_fuse_available() -> bool {
-    // Check if /dev/fuse exists
-    Path::new("/dev/fuse").exists()
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux, check if /dev/fuse exists
+        Path::new("/dev/fuse").exists()
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, check if macFUSE is installed
+        Path::new("/Library/Filesystems/macfuse.fs").exists() ||
+        Path::new("/usr/local/lib/libfuse.dylib").exists() ||
+        Path::new("/opt/homebrew/lib/libfuse.dylib").exists()
+    }
+    
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]
