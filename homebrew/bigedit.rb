@@ -59,8 +59,10 @@ class Bigedit < Formula
         
         To enable FUSE features (virtual file view for other programs):
           1. Install macFUSE: brew install --cask macfuse
-          2. Allow the kernel extension in System Settings > Privacy & Security
-          3. Reinstall bigedit: brew reinstall bigedit
+          2. Go to System Settings > Privacy & Security
+          3. Allow the system extension from developer "Benjamin Fleischer"
+          4. Reboot your Mac
+          5. Reinstall bigedit: brew reinstall bigedit
       EOS
     else
       <<~EOS

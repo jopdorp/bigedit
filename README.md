@@ -61,7 +61,13 @@ brew install bigedit
 > **Note:** On macOS, bigedit works without FUSE for basic editing. For FUSE features (virtual file view for other programs), install [macFUSE](https://osxfuse.github.io/) first:
 > ```bash
 > brew install --cask macfuse
-> # Allow the kernel extension in System Settings > Privacy & Security
+> ```
+> After installation:
+> 1. Go to **System Settings → Privacy & Security**
+> 2. Allow the system extension from developer **Benjamin Fleischer**
+> 3. Reboot your Mac
+> 4. Reinstall bigedit with FUSE support:
+> ```bash
 > brew reinstall bigedit
 > ```
 
