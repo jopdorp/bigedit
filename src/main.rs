@@ -40,11 +40,34 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let path = PathBuf::from(&args[1]);
+    // Check for --vi flag
+    let mut vi_mode = false;
+    let mut file_arg = None;
+    
+    for arg in &args[1..] {
+        if arg == "--vi" {
+            vi_mode = true;
+        } else if !arg.starts_with('-') {
+            file_arg = Some(arg.clone());
+        }
+    }
+    
+    let path = match file_arg {
+        Some(f) => PathBuf::from(f),
+        None => {
+            print_usage(&args[0]);
+            return Ok(());
+        }
+    };
 
     // Create and run the application
     let mut app = App::new(&path)
         .context("Failed to initialize editor")?;
+    
+    // Enable vi mode if requested
+    if vi_mode {
+        app.set_vi_mode();
+    }
 
     app.run()
         .context("Editor error")?;
@@ -57,13 +80,18 @@ fn print_usage(program: &str) {
         r#"bigedit - Streaming TUI editor for very large files
 
 USAGE:
-    {} <file>
+    {} [OPTIONS] <file>
 
 DESCRIPTION:
     Edit multi-GB text files without loading them into memory.
-    Uses a nano-like interface with streaming read/write.
+    Supports both nano-like (default) and vi-like keybindings.
 
-KEYBINDINGS:
+OPTIONS:
+    -h, --help      Show this help message
+    -v, --version   Show version
+    --vi            Start in vi mode (default is nano mode)
+
+NANO MODE KEYBINDINGS (default):
     Navigation:
         Arrow Keys      Move cursor
         Home/End        Start/end of line
@@ -87,11 +115,29 @@ KEYBINDINGS:
         F3              Find next
 
     Help:
-        Ctrl+G          Show help
+        F1              Show help
+        F2              Toggle vi/nano mode
 
-OPTIONS:
-    -h, --help      Show this help message
-    -v, --version   Show version
+VI MODE KEYBINDINGS (--vi):
+    Normal Mode:
+        h/j/k/l         Move cursor left/down/up/right
+        w/b             Next/previous word
+        0/$             Start/end of line
+        gg/G            Start/end of file
+        x               Delete character
+        dd              Delete line
+        yy              Yank (copy) line
+        p               Paste
+        i/a             Insert before/after cursor
+        o/O             Open line below/above
+        /               Search
+        :w              Save
+        :q              Quit
+        :wq             Save and quit
+
+    Insert Mode:
+        Escape          Return to normal mode
+        (type normally)
 
 FEATURES:
     • Fast open - only loads a small viewport of the file
@@ -101,7 +147,7 @@ FEATURES:
 
 EXAMPLES:
     {} large_file.sql
-    {} /var/log/huge.log
+    {} --vi /var/log/huge.log
 "#,
         program, program, program
     );

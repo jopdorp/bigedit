@@ -339,7 +339,25 @@ impl CursorPos {
     }
 }
 
-/// Edit mode for the editor
+/// Input style for the editor (Nano-like vs Vi-like keybindings)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputStyle {
+    #[default]
+    Nano,
+    Vi,
+}
+
+/// Vi mode states (only used when InputStyle is Vi)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViMode {
+    #[default]
+    Normal,
+    Insert,
+    Command,
+    Visual,
+}
+
+/// Edit mode for the editor (dialogs, prompts, etc.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EditorMode {
     #[default]

@@ -8,7 +8,7 @@ use crate::journal;
 use crate::overlay::{SaveStrategy, OverlaySession, ReflinkSession};
 use crate::save::save_file;
 use crate::search::{find_first_in_buffer, streaming_search_forward};
-use crate::types::EditorMode;
+use crate::types::{EditorMode, InputStyle, ViMode};
 use crate::viewport::display_width;
 
 use anyhow::Result;
@@ -25,9 +25,9 @@ use std::fs::File;
 use std::io::{self, Stdout};
 use std::path::Path;
 
-/// Help text content
-const HELP_TEXT: &str = r#"
-bigedit - Streaming Editor for Large Files
+/// Help text content (Nano mode)
+const HELP_TEXT_NANO: &str = r#"
+bigedit - Streaming Editor for Large Files (Nano Mode)
 
 Navigation:
   Arrow Keys    Move cursor
@@ -56,19 +56,50 @@ Search:
 
 Help:
   Ctrl+G        Show this help
+  F1            Show this help
   Esc           Cancel/close prompt
 
-SAVE MODES:
+Toggle Mode:
+  Ctrl+V        Switch to Vi mode
 
-  Journal Mode (default):
-    Saves patches to .filename.bigedit-journal
-    Original file unchanged - other programs see old content
-    Use Ctrl+J to write changes to original file
+Press any key to close this help...
+"#;
 
-  FUSE Mode:
-    Mounts a virtual view at .filename.view/filename
-    Other programs (less, cat, etc.) can read patched content
-    Original file still unchanged until Ctrl+J
+/// Help text content (Vi mode)
+const HELP_TEXT_VI: &str = r#"
+bigedit - Streaming Editor for Large Files (Vi Mode)
+
+NORMAL MODE:
+  h/j/k/l       Move cursor left/down/up/right
+  w/b           Next/previous word
+  0/$           Start/end of line
+  gg/G          Start/end of file
+  x             Delete character
+  dd            Delete line
+  yy            Yank (copy) line
+  p             Paste after cursor
+  u             Undo (not implemented yet)
+
+INSERT MODE:
+  i             Insert before cursor
+  a             Insert after cursor
+  o             Open line below
+  O             Open line above
+  Esc           Return to normal mode
+
+COMMAND MODE (press : in normal mode):
+  :w            Save (journal mode)
+  :q            Quit
+  :wq           Save and quit
+  :q!           Quit without saving
+
+SEARCH:
+  /pattern      Search forward
+  n             Find next
+  N             Find previous
+
+Toggle Mode:
+  Ctrl+V        Switch to Nano mode
 
 Press any key to close this help...
 "#;
@@ -120,6 +151,13 @@ impl App {
             reflink_session: None,
             fuse_mount: None,
         })
+    }
+
+    /// Enable vi mode
+    pub fn set_vi_mode(&mut self) {
+        self.editor.input_style = InputStyle::Vi;
+        self.editor.vi_mode = ViMode::Normal;
+        self.editor.set_status("Vi mode | F1=help, F2=toggle to nano");
     }
 
     /// Run the main event loop
@@ -175,8 +213,32 @@ impl App {
     fn handle_events(&mut self) -> Result<()> {
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                // F2 toggles input style (works in both nano and vi)
+                if key.code == KeyCode::F(2) {
+                    self.editor.toggle_input_style();
+                    let mode_name = match self.editor.input_style {
+                        InputStyle::Nano => "Nano",
+                        InputStyle::Vi => "Vi",
+                    };
+                    self.editor.set_status(format!("Switched to {} mode (F2 to toggle)", mode_name));
+                    return Ok(());
+                }
+                
+                // F1 shows help in both modes
+                if key.code == KeyCode::F(1) {
+                    self.editor.mode = EditorMode::Help;
+                    return Ok(());
+                }
+
+                // Dispatch based on editor mode (dialogs take precedence)
                 match self.editor.mode {
-                    EditorMode::Normal => self.handle_normal_mode(key)?,
+                    EditorMode::Normal => {
+                        // In normal editor mode, dispatch based on input style
+                        match self.editor.input_style {
+                            InputStyle::Nano => self.handle_nano_mode(key)?,
+                            InputStyle::Vi => self.handle_vi_mode(key)?,
+                        }
+                    }
                     EditorMode::Search => self.handle_search_mode(key)?,
                     EditorMode::Save => self.handle_save_mode(key)?,
                     EditorMode::Help => self.handle_help_mode(key)?,
@@ -187,8 +249,8 @@ impl App {
         Ok(())
     }
 
-    /// Handle keypress in normal mode
-    fn handle_normal_mode(&mut self, key: KeyEvent) -> Result<()> {
+    /// Handle keypress in nano mode (original behavior)
+    fn handle_nano_mode(&mut self, key: KeyEvent) -> Result<()> {
         match (key.modifiers, key.code) {
             // Exit
             (KeyModifiers::CONTROL, KeyCode::Char('x')) => {
@@ -320,6 +382,246 @@ impl App {
             }
 
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Handle keypress in vi mode
+    fn handle_vi_mode(&mut self, key: KeyEvent) -> Result<()> {
+        match self.editor.vi_mode {
+            ViMode::Normal => self.handle_vi_normal(key)?,
+            ViMode::Insert => self.handle_vi_insert(key)?,
+            ViMode::Command => self.handle_vi_command(key)?,
+            ViMode::Visual => {} // TODO: implement visual mode
+        }
+        Ok(())
+    }
+
+    /// Handle vi normal mode
+    fn handle_vi_normal(&mut self, key: KeyEvent) -> Result<()> {
+        match (key.modifiers, key.code) {
+            // Mode switching
+            (KeyModifiers::NONE, KeyCode::Char('i')) => {
+                self.editor.set_vi_mode(ViMode::Insert);
+            }
+            (KeyModifiers::NONE, KeyCode::Char('a')) => {
+                self.editor.cursor_right();
+                self.editor.set_vi_mode(ViMode::Insert);
+            }
+            (KeyModifiers::NONE, KeyCode::Char('o')) => {
+                self.editor.cursor_end();
+                self.editor.insert_newline()?;
+                self.editor.set_vi_mode(ViMode::Insert);
+                self.terminal.clear()?;
+            }
+            (KeyModifiers::SHIFT, KeyCode::Char('O')) => {
+                self.editor.cursor_home();
+                self.editor.insert_newline()?;
+                self.editor.cursor_up();
+                self.editor.set_vi_mode(ViMode::Insert);
+                self.terminal.clear()?;
+            }
+            (KeyModifiers::NONE, KeyCode::Char(':')) => {
+                self.editor.set_vi_mode(ViMode::Command);
+                self.editor.input_buffer.clear();
+                self.editor.set_status(":");
+            }
+            (KeyModifiers::NONE, KeyCode::Char('/')) => {
+                self.editor.mode = EditorMode::Search;
+                self.editor.input_buffer.clear();
+                self.editor.set_status("/");
+            }
+
+            // Navigation
+            (KeyModifiers::NONE, KeyCode::Char('h')) | (KeyModifiers::NONE, KeyCode::Left) => {
+                self.editor.cursor_left();
+            }
+            (KeyModifiers::NONE, KeyCode::Char('j')) | (KeyModifiers::NONE, KeyCode::Down) => {
+                self.editor.cursor_down();
+            }
+            (KeyModifiers::NONE, KeyCode::Char('k')) | (KeyModifiers::NONE, KeyCode::Up) => {
+                self.editor.cursor_up();
+            }
+            (KeyModifiers::NONE, KeyCode::Char('l')) | (KeyModifiers::NONE, KeyCode::Right) => {
+                self.editor.cursor_right();
+            }
+            (KeyModifiers::NONE, KeyCode::Char('0')) | (KeyModifiers::NONE, KeyCode::Home) => {
+                self.editor.cursor_home();
+            }
+            (KeyModifiers::NONE, KeyCode::Char('$')) | (KeyModifiers::NONE, KeyCode::End) => {
+                self.editor.cursor_end();
+            }
+            (KeyModifiers::NONE, KeyCode::Char('w')) => {
+                self.editor.cursor_next_word();
+            }
+            (KeyModifiers::NONE, KeyCode::Char('b')) => {
+                self.editor.cursor_prev_word();
+            }
+            (KeyModifiers::SHIFT, KeyCode::Char('G')) => {
+                // Go to end of file
+                let file_len = self.editor.file_length;
+                let start = file_len.saturating_sub(1024 * 1024);
+                self.editor.reload_viewport(start)?;
+                self.editor.cursor.row = self.editor.viewport.line_count().saturating_sub(1);
+                self.editor.cursor_end();
+            }
+            (KeyModifiers::NONE, KeyCode::Char('g')) => {
+                // Store 'g' in command buffer, wait for second 'g'
+                if self.editor.vi_command_buffer == "g" {
+                    // gg - go to start of file
+                    self.editor.reload_viewport(0)?;
+                    self.editor.cursor.row = 0;
+                    self.editor.cursor.col = 0;
+                    self.editor.scroll_offset = 0;
+                    self.editor.vi_command_buffer.clear();
+                } else {
+                    self.editor.vi_command_buffer = "g".to_string();
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::PageUp) => {
+                let height = self.terminal.size()?.height as usize - 3;
+                self.editor.page_up(height);
+                self.terminal.clear()?;
+            }
+            (KeyModifiers::NONE, KeyCode::PageDown) => {
+                let height = self.terminal.size()?.height as usize - 3;
+                self.editor.page_down(height);
+                self.terminal.clear()?;
+            }
+
+            // Editing
+            (KeyModifiers::NONE, KeyCode::Char('x')) => {
+                self.editor.delete_forward()?;
+            }
+            (KeyModifiers::NONE, KeyCode::Char('d')) => {
+                if self.editor.vi_command_buffer == "d" {
+                    // dd - delete line
+                    self.editor.cut_line()?;
+                    self.terminal.clear()?;
+                    self.editor.vi_command_buffer.clear();
+                } else {
+                    self.editor.vi_command_buffer = "d".to_string();
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Char('y')) => {
+                if self.editor.vi_command_buffer == "y" {
+                    // yy - yank line
+                    self.editor.yank_line()?;
+                    self.editor.set_status("Line yanked");
+                    self.editor.vi_command_buffer.clear();
+                } else {
+                    self.editor.vi_command_buffer = "y".to_string();
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Char('p')) => {
+                self.editor.paste()?;
+                self.editor.set_status("Pasted");
+            }
+
+            // Search
+            (KeyModifiers::NONE, KeyCode::Char('n')) => {
+                self.find_next()?;
+            }
+
+            _ => {
+                // Clear command buffer on unrecognized key
+                self.editor.vi_command_buffer.clear();
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle vi insert mode
+    fn handle_vi_insert(&mut self, key: KeyEvent) -> Result<()> {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.editor.set_vi_mode(ViMode::Normal);
+            }
+            (KeyModifiers::NONE, KeyCode::Backspace) => {
+                self.editor.delete_backward()?;
+                self.terminal.clear()?;
+            }
+            (KeyModifiers::NONE, KeyCode::Delete) => {
+                self.editor.delete_forward()?;
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                self.editor.insert_newline()?;
+                self.terminal.clear()?;
+            }
+            (KeyModifiers::NONE, KeyCode::Tab) => {
+                self.editor.insert_bytes(b"    ")?;
+            }
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
+                self.editor.insert_char(c)?;
+            }
+            // Arrow keys still work in insert mode
+            (KeyModifiers::NONE, KeyCode::Up) => self.editor.cursor_up(),
+            (KeyModifiers::NONE, KeyCode::Down) => self.editor.cursor_down(),
+            (KeyModifiers::NONE, KeyCode::Left) => self.editor.cursor_left(),
+            (KeyModifiers::NONE, KeyCode::Right) => self.editor.cursor_right(),
+            (KeyModifiers::NONE, KeyCode::Home) => self.editor.cursor_home(),
+            (KeyModifiers::NONE, KeyCode::End) => self.editor.cursor_end(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Handle vi command mode (after pressing :)
+    fn handle_vi_command(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.editor.set_vi_mode(ViMode::Normal);
+                self.editor.clear_status();
+            }
+            KeyCode::Enter => {
+                let cmd = self.editor.input_buffer.clone();
+                self.editor.set_vi_mode(ViMode::Normal);
+                self.execute_vi_command(&cmd)?;
+            }
+            KeyCode::Backspace => {
+                if self.editor.input_buffer.is_empty() {
+                    self.editor.set_vi_mode(ViMode::Normal);
+                    self.editor.clear_status();
+                } else {
+                    self.editor.input_buffer.pop();
+                    self.editor.set_status(format!(":{}", self.editor.input_buffer));
+                }
+            }
+            KeyCode::Char(c) => {
+                self.editor.input_buffer.push(c);
+                self.editor.set_status(format!(":{}", self.editor.input_buffer));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Execute a vi command (from command mode)
+    fn execute_vi_command(&mut self, cmd: &str) -> Result<()> {
+        match cmd.trim() {
+            "w" => {
+                self.save_file()?;
+            }
+            "q" => {
+                if self.editor.is_modified() {
+                    self.editor.set_status("No write since last change (use :q! to override)");
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            "q!" => {
+                self.should_quit = true;
+            }
+            "wq" | "x" => {
+                self.save_file()?;
+                self.should_quit = true;
+            }
+            "help" => {
+                self.editor.mode = EditorMode::Help;
+            }
+            _ => {
+                self.editor.set_status(format!("Unknown command: {}", cmd));
+            }
         }
         Ok(())
     }
@@ -678,10 +980,18 @@ fn draw_text_area(frame: &mut ratatui::Frame, editor: &Editor, area: Rect) {
     frame.render_widget(Clear, area);
 
     if editor.mode == EditorMode::Help {
-        // Draw help screen
-        let help = Paragraph::new(HELP_TEXT)
+        // Draw help screen (different text based on input style)
+        let help_text = match editor.input_style {
+            InputStyle::Nano => HELP_TEXT_NANO,
+            InputStyle::Vi => HELP_TEXT_VI,
+        };
+        let title = match editor.input_style {
+            InputStyle::Nano => "Help (Nano Mode)",
+            InputStyle::Vi => "Help (Vi Mode)",
+        };
+        let help = Paragraph::new(help_text)
             .style(Style::default().fg(Color::White))
-            .block(Block::default().borders(Borders::ALL).title("Help"));
+            .block(Block::default().borders(Borders::ALL).title(title));
         frame.render_widget(help, area);
         return;
     }
@@ -757,6 +1067,50 @@ fn draw_status_bar(frame: &mut ratatui::Frame, editor: &Editor, area: Rect) {
 
 /// Draw the help/shortcut bar
 fn draw_help_bar(frame: &mut ratatui::Frame, editor: &Editor, save_strategy: SaveStrategy, area: Rect) {
+    // Vi mode: show mode indicator instead of shortcuts
+    if editor.input_style == InputStyle::Vi {
+        let mode_text = match editor.vi_mode {
+            ViMode::Normal => "-- NORMAL --",
+            ViMode::Insert => "-- INSERT --",
+            ViMode::Command => "-- COMMAND --",
+            ViMode::Visual => "-- VISUAL --",
+        };
+        
+        let mode_color = match editor.vi_mode {
+            ViMode::Normal => Color::Cyan,
+            ViMode::Insert => Color::Green,
+            ViMode::Command => Color::Yellow,
+            ViMode::Visual => Color::Magenta,
+        };
+
+        let spans = vec![
+            Span::styled(
+                format!(" {} ", mode_text),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(mode_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" [{}] ", save_strategy.description()),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " F1=Help ^V=Nano ",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+
+        let help_bar = Paragraph::new(Line::from(spans))
+            .style(Style::default().bg(Color::DarkGray));
+
+        frame.render_widget(help_bar, area);
+        return;
+    }
+
+    // Nano mode: show shortcuts
     let shortcuts = match editor.mode {
         EditorMode::Search => vec![
             ("Enter", "Search"),
@@ -804,6 +1158,12 @@ fn draw_help_bar(frame: &mut ratatui::Frame, editor: &Editor, save_strategy: Sav
 
     let mut all_spans = spans;
     all_spans.push(mode_indicator);
+    
+    // Add vi mode toggle hint
+    all_spans.push(Span::styled(
+        " ^V=Vi ",
+        Style::default().fg(Color::DarkGray),
+    ));
 
     let help_bar = Paragraph::new(Line::from(all_spans))
         .style(Style::default().bg(Color::DarkGray));

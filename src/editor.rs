@@ -4,7 +4,7 @@
 
 use crate::journal;
 use crate::patches::PatchList;
-use crate::types::{CursorPos, CutBuffer, EditorMode, FilePos, MapResult};
+use crate::types::{CursorPos, CutBuffer, EditorMode, FilePos, InputStyle, MapResult, ViMode};
 use crate::viewport::{count_graphemes, Viewport, DEFAULT_VIEWPORT_SIZE, VIEWPORT_MARGIN};
 use anyhow::{Context, Result};
 use std::fs::File;
@@ -30,6 +30,12 @@ pub struct Editor {
     pub scroll_offset: usize,
     /// Current editor mode
     pub mode: EditorMode,
+    /// Input style (Nano vs Vi keybindings)
+    pub input_style: InputStyle,
+    /// Vi mode state (only used when input_style is Vi)
+    pub vi_mode: ViMode,
+    /// Vi command buffer (for commands like "dd", "3w", etc.)
+    pub vi_command_buffer: String,
     /// Cut buffer for cut/paste
     pub cut_buffer: CutBuffer,
     /// Status message to display
@@ -83,12 +89,34 @@ impl Editor {
             cursor: CursorPos::origin(),
             scroll_offset: 0,
             mode: EditorMode::Normal,
+            input_style: InputStyle::Nano,
+            vi_mode: ViMode::Normal,
+            vi_command_buffer: String::new(),
             cut_buffer: CutBuffer::new(),
             status_message,
             search_query: String::new(),
             input_buffer: String::new(),
             modified: false,
         })
+    }
+
+    /// Toggle between Nano and Vi input styles
+    pub fn toggle_input_style(&mut self) {
+        match self.input_style {
+            InputStyle::Nano => {
+                self.input_style = InputStyle::Vi;
+                self.vi_mode = ViMode::Normal;
+            }
+            InputStyle::Vi => {
+                self.input_style = InputStyle::Nano;
+            }
+        }
+    }
+
+    /// Set vi mode and update status
+    pub fn set_vi_mode(&mut self, mode: ViMode) {
+        self.vi_mode = mode;
+        self.vi_command_buffer.clear();
     }
 
     /// Create a new empty file for editing
@@ -195,6 +223,97 @@ impl Editor {
     /// Move to end of line
     pub fn cursor_end(&mut self) {
         self.cursor.col = self.current_line_grapheme_count();
+    }
+
+    /// Move to next word (vi 'w' command)
+    pub fn cursor_next_word(&mut self) {
+        if let Some(line_bytes) = self.viewport.line_bytes(self.cursor.row) {
+            let line = String::from_utf8_lossy(line_bytes);
+            use unicode_segmentation::UnicodeSegmentation;
+            let graphemes: Vec<&str> = line.graphemes(true).collect();
+            
+            let mut col = self.cursor.col;
+            let len = graphemes.len();
+            
+            // Skip current word (non-whitespace)
+            while col < len && !graphemes[col].chars().all(char::is_whitespace) {
+                col += 1;
+            }
+            // Skip whitespace
+            while col < len && graphemes[col].chars().all(char::is_whitespace) {
+                col += 1;
+            }
+            
+            if col >= len {
+                // Move to next line
+                if self.cursor.row + 1 < self.viewport.line_count() {
+                    self.cursor.row += 1;
+                    self.cursor.col = 0;
+                    // Skip leading whitespace on new line
+                    self.cursor_next_word_start();
+                }
+            } else {
+                self.cursor.col = col;
+            }
+        }
+    }
+
+    /// Skip to start of next word on current line (helper)
+    fn cursor_next_word_start(&mut self) {
+        if let Some(line_bytes) = self.viewport.line_bytes(self.cursor.row) {
+            let line = String::from_utf8_lossy(line_bytes);
+            use unicode_segmentation::UnicodeSegmentation;
+            let graphemes: Vec<&str> = line.graphemes(true).collect();
+            
+            let mut col = self.cursor.col;
+            // Skip leading whitespace
+            while col < graphemes.len() && graphemes[col].chars().all(char::is_whitespace) {
+                col += 1;
+            }
+            self.cursor.col = col;
+        }
+    }
+
+    /// Move to previous word (vi 'b' command)
+    pub fn cursor_prev_word(&mut self) {
+        if let Some(line_bytes) = self.viewport.line_bytes(self.cursor.row) {
+            let line = String::from_utf8_lossy(line_bytes);
+            use unicode_segmentation::UnicodeSegmentation;
+            let graphemes: Vec<&str> = line.graphemes(true).collect();
+            
+            if self.cursor.col == 0 {
+                // Move to previous line
+                if self.cursor.row > 0 {
+                    self.cursor.row -= 1;
+                    self.cursor.col = self.current_line_grapheme_count();
+                    self.cursor_prev_word();
+                }
+                return;
+            }
+            
+            let mut col = self.cursor.col.saturating_sub(1);
+            
+            // Skip whitespace backwards
+            while col > 0 && graphemes[col].chars().all(char::is_whitespace) {
+                col -= 1;
+            }
+            // Skip word backwards
+            while col > 0 && !graphemes[col - 1].chars().all(char::is_whitespace) {
+                col -= 1;
+            }
+            
+            self.cursor.col = col;
+        }
+    }
+
+    /// Yank (copy) current line to cut buffer
+    pub fn yank_line(&mut self) -> Result<()> {
+        if let Some(line_bytes) = self.viewport.line_bytes(self.cursor.row) {
+            let mut content = line_bytes.to_vec();
+            content.push(b'\n');
+            self.cut_buffer.set(content);
+        }
+        Ok(())
     }
 
     /// Page up

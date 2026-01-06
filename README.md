@@ -101,7 +101,7 @@ brew install --cask macfuse
 bigedit <filename>
 ```
 
-### Keybindings
+### Keybindings (Nano Mode - Default)
 
 | Key | Action |
 |-----|--------|
@@ -127,6 +127,47 @@ bigedit <filename>
 | F3 | Find next |
 | **Help** | |
 | Ctrl+G | Show help |
+| F1 | Show help |
+| **Mode Toggle** | |
+| Ctrl+V | Switch to Vi mode |
+
+### Vi Mode
+
+Press `Ctrl+V` to switch to Vi mode. The bottom bar will show the current mode (`-- NORMAL --`, `-- INSERT --`, etc.).
+
+#### Normal Mode
+| Key | Action |
+|-----|--------|
+| h/j/k/l | Move cursor left/down/up/right |
+| w/b | Next/previous word |
+| 0/$ | Start/end of line |
+| gg/G | Start/end of file |
+| x | Delete character |
+| dd | Delete line |
+| yy | Yank (copy) line |
+| p | Paste |
+| i | Insert before cursor |
+| a | Insert after cursor |
+| o/O | Open line below/above |
+| : | Enter command mode |
+| / | Search |
+| n | Find next |
+
+#### Insert Mode
+| Key | Action |
+|-----|--------|
+| Esc | Return to normal mode |
+| Arrow keys | Navigate |
+| All text input | Insert characters |
+
+#### Command Mode (after pressing `:`)
+| Command | Action |
+|---------|--------|
+| :w | Save (journal mode) |
+| :q | Quit |
+| :q! | Quit without saving |
+| :wq | Save and quit |
+| :help | Show help |
 
 ## How It Works
 
@@ -193,9 +234,26 @@ systemctl --user restart bigedit-watcher.service
         ▼                       ▼                        ▼
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
 │  original file  │     │  patches stored  │     │  .file.view/    │
-│                 │     │  as binary data  │     │  (virtual file) │
-└─────────────────┘     └──────────────────┘     └─────────────────┘
+│  (unchanged)    │     │  as binary data  │     │  (FUSE mount)   │
+└─────────────────┘     └──────────────────┘     └────────┬────────┘
+                                                          │
+                                                          ▼
+                                                 ┌─────────────────┐
+                                                 │ file.edited     │
+                                                 │ (symlink)       │
+                                                 └─────────────────┘
 ```
+
+**File layout when editing `data.sql`:**
+```
+data.sql                    # Original file (unchanged until compact)
+.data.sql.bigedit-journal   # Patches stored here (instant save)
+.data.sql.view/             # FUSE mount directory
+  └── data.sql              # Virtual file with patches applied
+data.sql.edited             # Symlink → .data.sql.view/data.sql
+```
+
+Other programs can read `data.sql.edited` to see your changes in real-time, before you write them to the original file with Ctrl+J.
 
 ## License
 
