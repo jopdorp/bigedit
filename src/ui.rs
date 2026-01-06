@@ -1180,8 +1180,8 @@ fn draw_help_bar(frame: &mut ratatui::Frame, editor: &Editor, save_strategy: Sav
         ],
         _ => vec![
             ("^O", "Save"),
-            ("^J", "WriteFile"),
-            ("^T", "Mode"),
+            ("^Z", "Undo"),
+            ("^Y", "Redo"),
             ("^W", "Search"),
             ("^G", "Help"),
             ("^X", "Exit"),
