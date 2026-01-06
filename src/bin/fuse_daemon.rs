@@ -22,8 +22,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    Request,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, Request,
 };
 
 // Re-use types from the main crate
@@ -57,7 +57,7 @@ impl PatchList {
 }
 
 /// Journal file magic number
-const JOURNAL_MAGIC: &[u8; 8] = b"BIGEDIT\0";
+const JOURNAL_MAGIC: &[u8; 8] = b"BIGEDITJ";
 const JOURNAL_VERSION: u32 = 1;
 
 /// Get journal path for a file
@@ -428,6 +428,26 @@ impl Filesystem for PatchedFileFS {
             reply.error(libc::ENOENT);
         }
     }
+
+    fn access(&mut self, _req: &Request<'_>, ino: u64, mask: i32, reply: fuser::ReplyEmpty) {
+        // Check if the inode exists
+        if ino == ROOT_INO || ino == FILE_INO {
+            // Check requested access against file permissions
+            // F_OK = 0 (existence), R_OK = 4, W_OK = 2, X_OK = 1
+            const W_OK: i32 = 2;
+            const X_OK: i32 = 1;
+            
+            // Deny write or execute access (read-only filesystem)
+            if (mask & W_OK) != 0 || (mask & X_OK) != 0 {
+                reply.error(libc::EACCES);
+            } else {
+                // Allow read access or existence check
+                reply.ok();
+            }
+        } else {
+            reply.error(libc::ENOENT);
+        }
+    }
 }
 
 /// Store PID file for the daemon
@@ -537,6 +557,9 @@ fn main() -> Result<()> {
         MountOption::FSName("bigedit".to_string()),
         MountOption::CUSTOM("volname=bigedit".to_string()),
         MountOption::CUSTOM("local".to_string()),
+        MountOption::CUSTOM("noapplexattr".to_string()),
+        MountOption::CUSTOM("noappledouble".to_string()),
+        MountOption::CUSTOM("defer_permissions".to_string()),
     ];
     
     #[cfg(not(target_os = "macos"))]
