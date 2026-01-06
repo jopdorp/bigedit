@@ -616,7 +616,7 @@ impl App {
                 self.save_file()?;
                 self.should_quit = true;
             }
-            "help" => {
+            "help" | "h" => {
                 self.editor.mode = EditorMode::Help;
             }
             _ => {
