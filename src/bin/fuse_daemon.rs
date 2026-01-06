@@ -476,6 +476,33 @@ fn main() -> Result<()> {
     // Create symlink for cleaner access: filename.edited -> .filename.view/filename
     let symlink_path = parent.join(format!("{}.edited", base_name));
 
+    // Clean up any stale mount point from a previous crashed session
+    if mount_point.exists() {
+        // Try to unmount first (in case it's a stale FUSE mount)
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("umount")
+                .arg(&mount_point)
+                .output();
+            // Also try diskutil unmount for macFUSE
+            let _ = std::process::Command::new("diskutil")
+                .args(["unmount", "force"])
+                .arg(&mount_point)
+                .output();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("fusermount")
+                .args(["-u", "-z"]) // lazy unmount
+                .arg(&mount_point)
+                .output();
+        }
+        // Give it a moment to unmount
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Now try to remove the directory
+        let _ = std::fs::remove_dir(&mount_point);
+    }
+
     std::fs::create_dir_all(&mount_point)?;
     
     // Create symlink (remove if exists first)
@@ -503,6 +530,16 @@ fn main() -> Result<()> {
 
     // Mount the filesystem (this blocks until unmounted)
     let fs = PatchedFileFS::new(state);
+    
+    #[cfg(target_os = "macos")]
+    let options = vec![
+        MountOption::RO,
+        MountOption::FSName("bigedit".to_string()),
+        MountOption::CUSTOM("volname=bigedit".to_string()),
+        MountOption::CUSTOM("local".to_string()),
+    ];
+    
+    #[cfg(not(target_os = "macos"))]
     let options = vec![
         MountOption::RO,
         MountOption::FSName("bigedit".to_string()),
