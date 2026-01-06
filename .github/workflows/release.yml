@@ -299,7 +299,7 @@ jobs:
           # Update version and checksum
           cd aur-pkg
           sed -i "s/pkgver=.*/pkgver=$VERSION/" PKGBUILD
-          sed -i "s/sha256sums=('SKIP')/sha256sums=('$SHA256')/" PKGBUILD
+          sed -i "s/sha256sums=.*/sha256sums=('$SHA256')/" PKGBUILD
           
           # Generate .SRCINFO
           cat > .SRCINFO << EOF
@@ -313,7 +313,7 @@ jobs:
           	makedepends = cargo
           	makedepends = git
           	depends = fuse3
-          	optdepends = inotify-tools: for efficient file watching in bigedit-watcher
+          	depends = inotify-tools
           	source = bigedit-$VERSION.tar.gz::https://github.com/jopdorp/bigedit/archive/refs/tags/v$VERSION.tar.gz
           	sha256sums = $SHA256
           

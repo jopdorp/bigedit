@@ -16,7 +16,7 @@
 
 ## Installation
 
-### From APT Repository (Ubuntu/Debian)
+### Ubuntu/Debian (APT)
 
 ```bash
 # Add the repository
@@ -25,10 +25,38 @@ echo "deb [trusted=yes arch=amd64] https://jopdorp.github.io/bigedit stable main
 # Update and install
 sudo apt update
 sudo apt install bigedit
-
-# Enable the auto-mount service (optional but recommended)
-systemctl --user enable --now bigedit-watcher.service
 ```
+
+The bigedit-watcher service is enabled by default. To start it immediately:
+```bash
+systemctl --user daemon-reload && systemctl --user start bigedit-watcher.service
+```
+
+### Arch Linux (AUR)
+
+```bash
+# Using yay (install yay first if needed: https://github.com/Jguer/yay)
+yay -S bigedit
+
+# Or manually with makepkg
+git clone https://aur.archlinux.org/bigedit.git
+cd bigedit
+makepkg -si
+```
+
+The bigedit-watcher service is enabled by default. To start it immediately:
+```bash
+systemctl --user daemon-reload && systemctl --user start bigedit-watcher.service
+```
+
+### macOS (Homebrew)
+
+```bash
+brew tap jopdorp/bigedit
+brew install bigedit
+```
+
+> **Note:** macOS requires [macFUSE](https://osxfuse.github.io/) for FUSE features.
 
 ### From Source
 
@@ -50,18 +78,21 @@ cd bigedit
 ### Build Dependencies
 
 - Rust 1.70+
-- libfuse3-dev
+- libfuse3-dev (Linux) or macFUSE (macOS)
 - pkg-config
 
 ```bash
 # Ubuntu/Debian
-sudo apt install libfuse3-dev pkg-config fuse3
+sudo apt install libfuse3-dev pkg-config fuse3 inotify-tools
 
 # Fedora
-sudo dnf install fuse3-devel pkg-config fuse3
+sudo dnf install fuse3-devel pkg-config fuse3 inotify-tools
 
 # Arch
-sudo pacman -S fuse3 pkg-config
+sudo pacman -S fuse3 pkg-config inotify-tools
+
+# macOS
+brew install --cask macfuse
 ```
 
 ## Usage
