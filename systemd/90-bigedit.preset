@@ -1,0 +1,7 @@
+# Enable bigedit-watcher service by default for all users
+# This preset makes the FUSE auto-mount service start automatically
+# when users log in, so edited files are visible to other programs.
+#
+# Users can still disable it with:
+#   systemctl --user disable bigedit-watcher.service
+enable bigedit-watcher.service

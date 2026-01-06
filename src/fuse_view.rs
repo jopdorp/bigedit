@@ -364,13 +364,23 @@ fn mount_point_path(file_path: &Path) -> PathBuf {
     parent.join(format!(".{}.view", base_name))
 }
 
+/// Get the symlink path for a file (the user-friendly .edited file)
+fn symlink_path(file_path: &Path) -> PathBuf {
+    let parent = file_path.parent().unwrap_or(Path::new("."));
+    let base_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    parent.join(format!("{}.edited", base_name))
+}
+
 /// Handle to a running FUSE daemon
 pub struct FuseMount {
     /// Original file path
     file_path: PathBuf,
     /// Mount point directory
     mount_point: PathBuf,
-    /// Path to the virtual file within the mount
+    /// Path to the virtual file (the .edited symlink)
     virtual_file_path: PathBuf,
     /// PID of the daemon process (if spawned by us)
     daemon_pid: Option<u32>,
@@ -381,15 +391,9 @@ impl FuseMount {
     pub fn new(original_path: &Path) -> Result<Self> {
         let file_path = original_path.canonicalize()
             .context("Failed to get absolute path")?;
-        
-        let filename = file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file")
-            .to_string();
 
         let mount_point = mount_point_path(&file_path);
-        let virtual_file_path = mount_point.join(&filename);
+        let virtual_file_path = symlink_path(&file_path);
         let pid_file = pid_file_path(&file_path);
 
         // Check if daemon is already running
@@ -511,6 +515,10 @@ impl FuseMount {
         // Clean up PID file if it still exists
         let _ = std::fs::remove_file(&pid_file);
         
+        // Clean up symlink
+        let symlink = symlink_path(&self.file_path);
+        let _ = std::fs::remove_file(&symlink);
+        
         // Try to unmount and remove mount point
         let _ = std::process::Command::new("fusermount3")
             .args(["-u", &self.mount_point.display().to_string()])
@@ -528,6 +536,7 @@ impl FuseMount {
 pub fn kill_fuse_daemon(file_path: &Path) -> Result<()> {
     let pid_file = pid_file_path(file_path);
     let mount_point = mount_point_path(file_path);
+    let symlink = symlink_path(file_path);
     
     if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
@@ -537,6 +546,7 @@ pub fn kill_fuse_daemon(file_path: &Path) -> Result<()> {
     }
     
     let _ = std::fs::remove_file(&pid_file);
+    let _ = std::fs::remove_file(&symlink);
     let _ = std::process::Command::new("fusermount3")
         .args(["-u", &mount_point.display().to_string()])
         .output();

@@ -21,21 +21,22 @@ case "$1" in
         echo ""
         
         if [ "$ENABLE_SYSTEMD" = "yes" ]; then
-            echo "To enable the auto-mount service for your user, run:"
+            echo "The bigedit-watcher service is enabled by default for new user sessions."
             echo ""
-            echo "    systemctl --user enable --now bigedit-watcher.service"
+            echo "To start it now without logging out, run:"
             echo ""
-            echo "To disable it later:"
+            echo "    systemctl --user daemon-reload && systemctl --user enable --now bigedit-watcher.service"
+            echo ""
+            echo "To disable it:"
             echo ""
             echo "    systemctl --user disable --now bigedit-watcher.service"
             echo ""
         else
             echo "Systemd service installation was skipped."
-            echo "To enable it manually later, run:"
+            echo "To enable it manually, run:"
             echo ""
             echo "    systemctl --user enable --now bigedit-watcher.service"
-            echo ""
-        fi
+            echo ""        fi
         
         echo "Usage:"
         echo "    bigedit <filename>     Edit a file"

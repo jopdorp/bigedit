@@ -15,6 +15,8 @@ override_dh_auto_install:
 	install -D -m 755 systemd/bigedit-watcher $(CURDIR)/debian/bigedit/usr/bin/bigedit-watcher
 	install -D -m 644 systemd/bigedit-watcher.service $(CURDIR)/debian/bigedit/usr/lib/systemd/user/bigedit-watcher.service
 	install -D -m 644 systemd/bigedit-fuse@.service $(CURDIR)/debian/bigedit/usr/lib/systemd/user/bigedit-fuse@.service
+	# User preset to enable the watcher service by default
+	install -D -m 644 systemd/90-bigedit.preset $(CURDIR)/debian/bigedit/usr/lib/systemd/user-preset/90-bigedit.preset
 
 override_dh_auto_test:
 	# Skip tests during package build

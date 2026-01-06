@@ -29,13 +29,15 @@ log() {
 # Start FUSE mount for a journal file
 start_mount() {
     local journal_file="$1"
-    local original_file="${journal_file%.bigedit-journal}"
-    original_file="${original_file#.}"  # Remove leading dot
-    
-    # Get directory and reconstruct path
     local dir=$(dirname "$journal_file")
-    local base=$(basename "$original_file")
-    original_file="$dir/$base"
+    
+    # Journal file is .filename.bigedit-journal, extract original filename
+    local journal_basename=$(basename "$journal_file")
+    # Remove .bigedit-journal suffix first, then remove leading dot
+    local base="${journal_basename%.bigedit-journal}"
+    base="${base#.}"  # Remove leading dot from basename
+    
+    local original_file="$dir/$base"
     
     if [ ! -f "$original_file" ]; then
         log "Original file not found: $original_file"
@@ -68,6 +70,7 @@ stop_mount() {
     local base=$(basename "$original_file")
     local pid_file="$dir/.$base.bigedit-fuse.pid"
     local mount_point="$dir/.$base.view"
+    local symlink="$dir/$base.edited"
     
     if [ -f "$pid_file" ]; then
         local pid=$(cat "$pid_file")
@@ -76,6 +79,7 @@ stop_mount() {
         sleep 0.5
         fusermount3 -u "$mount_point" 2>/dev/null || true
         rm -f "$pid_file"
+        rm -f "$symlink" 2>/dev/null || true
         rmdir "$mount_point" 2>/dev/null || true
     fi
     
@@ -122,9 +126,10 @@ watch_journals() {
                     ;;
                 DELETE*|MOVED_FROM*)
                     # Journal deleted, stop mount
-                    local original_file="${journal_path%.bigedit-journal}"
-                    original_file="${original_file#.}"
-                    original_file="$(dirname "$journal_path")/$(basename "$original_file")"
+                    local journal_basename=$(basename "$journal_path")
+                    local base="${journal_basename%.bigedit-journal}"
+                    base="${base#.}"
+                    local original_file="$(dirname "$journal_path")/$base"
                     stop_mount "$original_file"
                     ;;
             esac

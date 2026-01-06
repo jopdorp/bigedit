@@ -41,10 +41,11 @@ jobs:
           cargo build --release
           
           # Create package directory structure
-          PKG_DIR="bigedit_0.1.0-1_${{ matrix.arch }}"
+          PKG_DIR="bigedit_0.1.2-1_${{ matrix.arch }}"
           mkdir -p "$PKG_DIR/DEBIAN"
           mkdir -p "$PKG_DIR/usr/bin"
           mkdir -p "$PKG_DIR/usr/lib/systemd/user"
+          mkdir -p "$PKG_DIR/usr/lib/systemd/user-preset"
           
           # Copy binaries
           cp target/release/bigedit "$PKG_DIR/usr/bin/"
@@ -56,10 +57,13 @@ jobs:
           cp systemd/bigedit-watcher.service "$PKG_DIR/usr/lib/systemd/user/"
           cp systemd/bigedit-fuse@.service "$PKG_DIR/usr/lib/systemd/user/"
           
+          # Copy user preset to enable service by default
+          cp systemd/90-bigedit.preset "$PKG_DIR/usr/lib/systemd/user-preset/"
+          
           # Create control file
           cat > "$PKG_DIR/DEBIAN/control" << 'EOF'
           Package: bigedit
-          Version: 0.1.0-1
+          Version: 0.1.2-1
           Section: editors
           Priority: optional
           Architecture: ${{ matrix.arch }}
@@ -122,6 +126,7 @@ jobs:
           Label: BigEdit
           Suite: stable
           Codename: stable
+          Date: $(date -Ru)
           Architectures: amd64
           Components: main
           Description: BigEdit APT Repository
@@ -171,9 +176,21 @@ jobs:
               </pre>
               
               <h3>Enable Auto-Mount Service</h3>
+              <p>The bigedit-watcher service is enabled by default for new user sessions. To start it immediately:</p>
               <pre>
-          # Enable the FUSE watcher to auto-mount patched file views
+          systemctl --user daemon-reload
           systemctl --user enable --now bigedit-watcher.service
+              </pre>
+              
+              <h3>Arch Linux (AUR)</h3>
+              <pre>
+          # Using yay
+          yay -S bigedit
+          
+          # Or manually
+          git clone https://github.com/jopdorp/bigedit.git
+          cd bigedit/arch
+          makepkg -si
               </pre>
               
               <h2>Usage</h2>
@@ -219,6 +236,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     
     steps:
+      - uses: actions/checkout@v4
+      
       - name: Download all deb artifacts
         uses: actions/download-artifact@v4
         with:
@@ -226,8 +245,20 @@ jobs:
           pattern: bigedit-deb-*
           merge-multiple: true
       
+      - name: Prepare Arch package files
+        run: |
+          mkdir -p arch-pkg
+          cp arch/PKGBUILD arch-pkg/
+          cp arch/bigedit.install arch-pkg/
+          # Update version in PKGBUILD from tag
+          VERSION=${GITHUB_REF#refs/tags/v}
+          sed -i "s/pkgver=.*/pkgver=$VERSION/" arch-pkg/PKGBUILD
+          tar -czvf bigedit-arch-$VERSION.tar.gz -C arch-pkg .
+      
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: debs/*.deb
+          files: |
+            debs/*.deb
+            bigedit-arch-*.tar.gz
           generate_release_notes: true

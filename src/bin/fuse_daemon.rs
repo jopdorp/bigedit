@@ -472,8 +472,16 @@ fn main() -> Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or("file");
     let mount_point = parent.join(format!(".{}.view", base_name));
+    
+    // Create symlink for cleaner access: filename.edited -> .filename.view/filename
+    let symlink_path = parent.join(format!("{}.edited", base_name));
 
     std::fs::create_dir_all(&mount_point)?;
+    
+    // Create symlink (remove if exists first)
+    let _ = std::fs::remove_file(&symlink_path);
+    let symlink_target = format!(".{}.view/{}", base_name, base_name);
+    std::os::unix::fs::symlink(&symlink_target, &symlink_path)?;
 
     // Write PID file
     let pid_path = write_pid_file(&file_path)?;
@@ -481,14 +489,16 @@ fn main() -> Result<()> {
     // Set up signal handler for cleanup
     let mount_point_clone = mount_point.clone();
     let pid_path_clone = pid_path.clone();
+    let symlink_path_clone = symlink_path.clone();
     ctrlc::set_handler(move || {
         let _ = std::fs::remove_file(&pid_path_clone);
+        let _ = std::fs::remove_file(&symlink_path_clone);
         let _ = std::fs::remove_dir(&mount_point_clone);
         std::process::exit(0);
     }).ok();
 
     eprintln!("bigedit-fuse: Mounting at {}", mount_point.display());
-    eprintln!("bigedit-fuse: Virtual file at {}/{}", mount_point.display(), filename);
+    eprintln!("bigedit-fuse: Virtual file at {}", symlink_path.display());
     eprintln!("bigedit-fuse: PID file at {}", pid_path.display());
 
     // Mount the filesystem (this blocks until unmounted)
@@ -502,6 +512,7 @@ fn main() -> Result<()> {
 
     // Cleanup on normal exit
     let _ = std::fs::remove_file(&pid_path);
+    let _ = std::fs::remove_file(&symlink_path);
     let _ = std::fs::remove_dir(&mount_point);
 
     Ok(())
