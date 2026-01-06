@@ -7,3 +7,9 @@
 # Added by cargo
 
 /target
+
+# Arch Linux build artifacts
+arch/*.pkg.tar.zst
+arch/*.tar.gz
+arch/pkg/
+arch/src/

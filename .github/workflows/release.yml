@@ -67,8 +67,7 @@ jobs:
           Section: editors
           Priority: optional
           Architecture: ${{ matrix.arch }}
-          Depends: fuse3
-          Recommends: inotify-tools
+          Depends: fuse3, inotify-tools
           Maintainer: BigEdit Contributors <bigedit@example.com>
           Description: Streaming TUI editor for very large files
            BigEdit is a terminal-based text editor designed to handle multi-gigabyte
@@ -262,3 +261,67 @@ jobs:
             debs/*.deb
             bigedit-arch-*.tar.gz
           generate_release_notes: true
+
+  publish-aur:
+    needs: create-release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Calculate source tarball checksum
+        id: checksum
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          # Download the source tarball from GitHub
+          curl -sL "https://github.com/jopdorp/bigedit/archive/refs/tags/v${VERSION}.tar.gz" -o source.tar.gz
+          SHA256=$(sha256sum source.tar.gz | cut -d' ' -f1)
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Prepare AUR package
+        run: |
+          VERSION=${{ steps.checksum.outputs.version }}
+          SHA256=${{ steps.checksum.outputs.sha256 }}
+          
+          mkdir -p aur-pkg
+          cp arch/PKGBUILD aur-pkg/
+          cp arch/bigedit.install aur-pkg/
+          
+          # Update version and checksum
+          cd aur-pkg
+          sed -i "s/pkgver=.*/pkgver=$VERSION/" PKGBUILD
+          sed -i "s/sha256sums=('SKIP')/sha256sums=('$SHA256')/" PKGBUILD
+          
+          # Generate .SRCINFO
+          cat > .SRCINFO << EOF
+          pkgbase = bigedit
+          	pkgdesc = A fast text editor for very large files using journaling and FUSE
+          	pkgver = $VERSION
+          	pkgrel = 1
+          	url = https://github.com/jopdorp/bigedit
+          	arch = x86_64
+          	license = MIT
+          	makedepends = cargo
+          	makedepends = git
+          	depends = fuse3
+          	optdepends = inotify-tools: for efficient file watching in bigedit-watcher
+          	source = bigedit-$VERSION.tar.gz::https://github.com/jopdorp/bigedit/archive/refs/tags/v$VERSION.tar.gz
+          	sha256sums = $SHA256
+          
+          pkgname = bigedit
+          EOF
+      
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4
+        with:
+          pkgname: bigedit
+          pkgbuild: aur-pkg/PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to version ${{ steps.checksum.outputs.version }}"
+          assets: |
+            aur-pkg/bigedit.install
+            aur-pkg/.SRCINFO

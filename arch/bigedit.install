@@ -8,10 +8,7 @@ post_install() {
     echo "║  mounts FUSE views for files being edited, so other programs     ║"
     echo "║  can see your changes before they're written to disk.            ║"
     echo "║                                                                   ║"
-    echo "║  The service is enabled by default. To start it now:             ║"
-    echo "║                                                                   ║"
-    echo "║    systemctl --user daemon-reload                                 ║"
-    echo "║    systemctl --user enable --now bigedit-watcher.service         ║"
+    echo "║  The bigedit-watcher service is enabled by default.              ║"
     echo "║                                                                   ║"
     echo "║  Usage:                                                           ║"
     echo "║    bigedit <filename>     Edit a file                             ║"
@@ -23,6 +20,12 @@ post_install() {
     echo "║    Ctrl+X     Exit                                                ║"
     echo "║                                                                   ║"
     echo "╚══════════════════════════════════════════════════════════════════╝"
+    echo ""
+    
+    # Try to start the service for logged-in users
+    # This runs during package install, so we notify users
+    echo "To start the watcher service now, run:"
+    echo "  systemctl --user daemon-reload && systemctl --user start bigedit-watcher.service"
     echo ""
 }
 
