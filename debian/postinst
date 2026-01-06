@@ -36,7 +36,8 @@ case "$1" in
             echo "To enable it manually, run:"
             echo ""
             echo "    systemctl --user enable --now bigedit-watcher.service"
-            echo ""        fi
+            echo ""
+        fi
         
         echo "Usage:"
         echo "    bigedit <filename>     Edit a file"
