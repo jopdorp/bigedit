@@ -37,11 +37,18 @@ jobs:
       
       - name: Build Debian package
         run: |
+          # Get version from tag or default
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="0.1.0"
+          fi
+          
           # Build release binaries
           cargo build --release
           
           # Create package directory structure
-          PKG_DIR="bigedit_0.1.2-1_${{ matrix.arch }}"
+          PKG_DIR="bigedit_${VERSION}-1_${{ matrix.arch }}"
           mkdir -p "$PKG_DIR/DEBIAN"
           mkdir -p "$PKG_DIR/usr/bin"
           mkdir -p "$PKG_DIR/usr/lib/systemd/user"
@@ -61,9 +68,9 @@ jobs:
           cp systemd/90-bigedit.preset "$PKG_DIR/usr/lib/systemd/user-preset/"
           
           # Create control file
-          cat > "$PKG_DIR/DEBIAN/control" << 'EOF'
+          cat > "$PKG_DIR/DEBIAN/control" << EOF
           Package: bigedit
-          Version: 0.1.2-1
+          Version: ${VERSION}-1
           Section: editors
           Priority: optional
           Architecture: ${{ matrix.arch }}
