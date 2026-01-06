@@ -1,6 +1,6 @@
 [package]
 name = "bigedit"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 description = "A streaming TUI editor for very large files"
 authors = ["bigedit contributors"]
@@ -43,8 +43,7 @@ fuser = { version = "0.14", optional = true }
 # Signal handling for FUSE daemon (optional)
 ctrlc = { version = "3.4", optional = true }
 
-# System calls for high-performance I/O (Linux)
-[target.'cfg(target_os = "linux")'.dependencies]
+# libc for FUSE error codes and system calls
 libc = "0.2"
 
 [profile.release]
