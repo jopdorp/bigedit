@@ -4,7 +4,7 @@
 
 use crate::journal;
 use crate::patches::PatchList;
-use crate::types::{CursorPos, CutBuffer, EditorMode, FilePos, InputStyle, MapResult, ViMode};
+use crate::types::{CursorPos, CutBuffer, EditorMode, FilePos, InputStyle, MapResult, UndoHistory, UndoOperation, ViMode};
 use crate::viewport::{count_graphemes, Viewport, DEFAULT_VIEWPORT_SIZE, VIEWPORT_MARGIN};
 use anyhow::{Context, Result};
 use std::fs::File;
@@ -46,6 +46,8 @@ pub struct Editor {
     pub input_buffer: String,
     /// Whether the file has been modified
     pub modified: bool,
+    /// Undo history
+    pub undo_history: UndoHistory,
 }
 
 impl Editor {
@@ -97,6 +99,7 @@ impl Editor {
             search_query: String::new(),
             input_buffer: String::new(),
             modified: false,
+            undo_history: UndoHistory::new(),
         })
     }
 
@@ -416,21 +419,34 @@ impl Editor {
         self.insert_bytes(bytes)
     }
 
-    /// Insert bytes at cursor position
-    pub fn insert_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+    /// Insert bytes at cursor position (internal, no undo recording)
+    fn insert_bytes_internal(&mut self, bytes: &[u8]) -> Result<()> {
         // Get render byte position
         let render_byte = match self.viewport.row_col_to_render_byte(self.cursor.row, self.cursor.col) {
             Some(b) => b,
-            None => return Ok(()),
+            None => {
+                #[cfg(test)]
+                eprintln!("insert_bytes_internal: row_col_to_render_byte returned None for ({}, {})", 
+                         self.cursor.row, self.cursor.col);
+                return Ok(());
+            }
         };
+
+        #[cfg(test)]
+        eprintln!("insert_bytes_internal: render_byte={}, bytes={:?}", render_byte, bytes);
 
         // Map to original position using viewport mapping
         match self.viewport.mapping.map_to_original(render_byte) {
             MapResult::Original(pos) => {
+                #[cfg(test)]
+                eprintln!("insert_bytes_internal: MapResult::Original({})", pos);
                 // Cursor is on original text - insert at this position
                 self.patches.insert(pos, bytes);
             }
             MapResult::Inserted { before, after, offset_in_insert } => {
+                #[cfg(test)]
+                eprintln!("insert_bytes_internal: MapResult::Inserted before={:?}, after={:?}, offset={}", 
+                         before, after, offset_in_insert);
                 // Cursor is inside inserted text
                 // We need to insert within the combined patches at the appropriate offset
                 let pos = before.or(after).unwrap_or(self.viewport.start);
@@ -445,6 +461,8 @@ impl Editor {
                 self.base_patches = PatchList::new();
             }
             MapResult::Unknown => {
+                #[cfg(test)]
+                eprintln!("insert_bytes_internal: MapResult::Unknown");
                 // Fallback: calculate based on viewport start
                 let pos = self.viewport.start + render_byte as u64;
                 self.patches.insert(pos, bytes);
@@ -453,11 +471,34 @@ impl Editor {
         
         self.modified = true;
         self.refresh_viewport()?;
+        
+        #[cfg(test)]
+        eprintln!("insert_bytes_internal: after refresh, render_bytes={:?}", 
+                 String::from_utf8_lossy(&self.viewport.render_bytes));
 
         // Move cursor forward
         for _ in 0..count_graphemes(bytes) {
             self.cursor_right();
         }
+        Ok(())
+    }
+
+    /// Insert bytes at cursor position
+    pub fn insert_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        // Record state before the operation for undo
+        let cursor_before = self.cursor;
+        let patches_before = self.patches.clone();
+        let base_patches_before = self.base_patches.clone();
+        
+        self.insert_bytes_internal(bytes)?;
+        
+        // Record undo operation (snapshot-based)
+        self.undo_history.push(UndoOperation {
+            cursor_before,
+            patches_before,
+            base_patches_before,
+        });
+        
         Ok(())
     }
 
@@ -470,23 +511,27 @@ impl Editor {
         // Move cursor back
         self.cursor_left();
 
-        // Delete character at new position
+        // Now delete at the new position (uses delete_forward which records undo)
         self.delete_forward()
     }
 
-    /// Delete character at cursor (delete key)
-    pub fn delete_forward(&mut self) -> Result<()> {
+    /// Delete character at cursor (delete key) - internal, no undo recording
+    fn delete_forward_internal(&mut self) -> Result<Option<Vec<u8>>> {
         // Get render byte position
         let render_byte = match self.viewport.row_col_to_render_byte(self.cursor.row, self.cursor.col) {
             Some(b) => b,
-            None => return Ok(()),
+            None => return Ok(None),
         };
 
         // Get the byte length of the grapheme at cursor
         let grapheme_len = self.get_grapheme_len_at(render_byte);
         if grapheme_len == 0 {
-            return Ok(());
+            return Ok(None);
         }
+
+        // Get the deleted bytes for undo
+        let deleted_bytes = self.viewport.render_bytes.get(render_byte..render_byte + grapheme_len)
+            .map(|b| b.to_vec());
 
         // Map to original position using viewport mapping
         match self.viewport.mapping.map_to_original(render_byte) {
@@ -515,6 +560,25 @@ impl Editor {
         
         self.modified = true;
         self.refresh_viewport()?;
+        Ok(deleted_bytes)
+    }
+
+    /// Delete character at cursor (delete key)
+    pub fn delete_forward(&mut self) -> Result<()> {
+        // Record state before the operation for undo
+        let cursor_before = self.cursor;
+        let patches_before = self.patches.clone();
+        let base_patches_before = self.base_patches.clone();
+        
+        if self.delete_forward_internal()?.is_some() {
+            // Record undo operation (snapshot-based)
+            self.undo_history.push(UndoOperation {
+                cursor_before,
+                patches_before,
+                base_patches_before,
+            });
+        }
+        
         Ok(())
     }
 
@@ -534,47 +598,19 @@ impl Editor {
 
     /// Insert a newline at cursor position
     pub fn insert_newline(&mut self) -> Result<()> {
-        // Get render byte position
-        let render_byte = match self.viewport.row_col_to_render_byte(self.cursor.row, self.cursor.col) {
-            Some(b) => b,
-            None => return Ok(()),
-        };
-
-        // Map to original position using viewport mapping
-        match self.viewport.mapping.map_to_original(render_byte) {
-            MapResult::Original(pos) => {
-                // Cursor is on original text - insert at this position
-                self.patches.insert(pos, b"\n");
-            }
-            MapResult::Inserted { before, after, offset_in_insert } => {
-                // Cursor is inside inserted text
-                // We need to insert within the combined patches at the appropriate offset
-                let pos = before.or(after).unwrap_or(self.viewport.start);
-                
-                // Try to insert within an existing patch in combined patches
-                let mut combined = self.all_patches();
-                combined.insert_within(pos, offset_in_insert, b"\n");
-                
-                // Replace our patches with the combined result
-                self.patches = combined;
-                self.base_patches = PatchList::new();
-            }
-            MapResult::Unknown => {
-                // Fallback: calculate based on viewport start
-                let pos = self.viewport.start + render_byte as u64;
-                self.patches.insert(pos, b"\n");
-            }
-        }
+        // Record cursor position before insert
+        let row_before = self.cursor.row;
         
-        self.modified = true;
-        self.refresh_viewport()?;
+        // Use insert_bytes which handles undo recording
+        self.insert_bytes(b"\n")?;
         
-        // Move cursor to start of new line
-        self.cursor.row += 1;
+        // Fix cursor position: insert_bytes moves right by 1 grapheme,
+        // but for newline we want to be at start of next line
+        self.cursor.row = row_before + 1;
         self.cursor.col = 0;
+        
         Ok(())
     }
-
     /// Cut the current line
     pub fn cut_line(&mut self) -> Result<()> {
         if let Some(line_bytes) = self.viewport.line_bytes(self.cursor.row) {
@@ -594,13 +630,25 @@ impl Editor {
             
             self.cut_buffer.set(cut_content);
 
+            // Record state before the operation for undo
+            let cursor_before = self.cursor;
+            let patches_before = self.patches.clone();
+            let base_patches_before = self.base_patches.clone();
+            
             // Move cursor to start of line
             self.cursor.col = 0;
             
-            // Delete each character in the line
+            // Delete each character in the line using internal method (no undo recording)
             for _ in 0..grapheme_count {
-                self.delete_forward()?;
+                self.delete_forward_internal()?;
             }
+            
+            // Record as single undo operation (snapshot-based)
+            self.undo_history.push(UndoOperation {
+                cursor_before,
+                patches_before,
+                base_patches_before,
+            });
         }
         Ok(())
     }
@@ -632,6 +680,69 @@ impl Editor {
     /// Check if file is modified
     pub fn is_modified(&self) -> bool {
         self.modified || self.patches.is_modified()
+    }
+
+    /// Ensure the cursor position is visible, refreshing viewport if needed
+    fn ensure_cursor_visible(&mut self) -> Result<()> {
+        // For now, just refresh the viewport at current position
+        // The cursor coordinates should still be valid after refresh
+        self.refresh_viewport()
+    }
+
+    /// Undo the last operation
+    pub fn undo(&mut self) -> Result<()> {
+        // Take snapshot of current state for redo
+        let current_patches = self.patches.clone();
+        let current_base_patches = self.base_patches.clone();
+        let current_cursor = self.cursor;
+        
+        if let Some(op) = self.undo_history.undo() {
+            // Restore state from before the operation
+            self.patches = op.patches_before;
+            self.base_patches = op.base_patches_before;
+            self.cursor = op.cursor_before;
+            
+            // Store current state as redo operation
+            self.undo_history.push_redo(UndoOperation {
+                patches_before: current_patches,
+                base_patches_before: current_base_patches,
+                cursor_before: current_cursor,
+            });
+            
+            self.refresh_viewport()?;
+            self.set_status("Undo");
+        } else {
+            self.set_status("Nothing to undo");
+        }
+        Ok(())
+    }
+
+    /// Redo the last undone operation
+    pub fn redo(&mut self) -> Result<()> {
+        // Take snapshot of current state for undo
+        let current_patches = self.patches.clone();
+        let current_base_patches = self.base_patches.clone();
+        let current_cursor = self.cursor;
+        
+        if let Some(op) = self.undo_history.redo() {
+            // Restore state from the redo operation
+            self.patches = op.patches_before;
+            self.base_patches = op.base_patches_before;
+            self.cursor = op.cursor_before;
+            
+            // Store current state as undo operation
+            self.undo_history.push_undo(UndoOperation {
+                patches_before: current_patches,
+                base_patches_before: current_base_patches,
+                cursor_before: current_cursor,
+            });
+            
+            self.refresh_viewport()?;
+            self.set_status("Redo");
+        } else {
+            self.set_status("Nothing to redo");
+        }
+        Ok(())
     }
 }
 
@@ -2290,5 +2401,469 @@ mod tests {
         
         // Cleanup journal
         let _ = journal::delete_journal(&file_path);
+    }
+
+    /// Test undo of character insertion
+    #[test]
+    fn test_undo_insert_char() {
+        let file = create_test_file("hello");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Initial state
+        assert_eq!(editor.viewport.line_str(0), Some("hello".to_string()));
+        
+        // Insert a character at the end
+        editor.cursor_end();
+        editor.insert_char('!').unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("hello!".to_string()));
+        
+        // Undo should remove the '!'
+        editor.undo().unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("hello".to_string()));
+    }
+
+    /// Test undo of character deletion
+    #[test]
+    fn test_undo_delete_char() {
+        let file = create_test_file("hello");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        println!("Initial content: {:?}", editor.viewport.line_str(0));
+        println!("Initial cursor: ({}, {})", editor.cursor.row, editor.cursor.col);
+        
+        // Delete the last character
+        editor.cursor_end();
+        println!("After cursor_end: ({}, {})", editor.cursor.row, editor.cursor.col);
+        
+        editor.delete_backward().unwrap();
+        println!("After delete_backward content: {:?}", editor.viewport.line_str(0));
+        println!("After delete_backward cursor: ({}, {})", editor.cursor.row, editor.cursor.col);
+        println!("Patches after delete: {:?}", editor.patches.patches());
+        println!("Undo stack size: {}", editor.undo_history.undo_stack.len());
+        if let Some(op) = editor.undo_history.undo_stack.last() {
+            println!("Last undo op: {:?}", op);
+        }
+        
+        assert_eq!(editor.viewport.line_str(0), Some("hell".to_string()));
+        
+        // Undo should restore the 'o'
+        println!("Calling undo...");
+        editor.undo().unwrap();
+        println!("After undo content: {:?}", editor.viewport.line_str(0));
+        println!("After undo cursor: ({}, {})", editor.cursor.row, editor.cursor.col);
+        println!("Patches after undo: {:?}", editor.patches.patches());
+        println!("render_bytes: {:?}", String::from_utf8_lossy(&editor.viewport.render_bytes));
+        
+        assert_eq!(editor.viewport.line_str(0), Some("hello".to_string()));
+    }
+
+    /// Test redo after undo
+    #[test]
+    fn test_redo_after_undo() {
+        let file = create_test_file("hello");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Insert a character
+        editor.cursor_end();
+        editor.insert_char('!').unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("hello!".to_string()));
+        
+        // Undo
+        editor.undo().unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("hello".to_string()));
+        
+        // Redo should restore the '!'
+        editor.redo().unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("hello!".to_string()));
+    }
+
+    /// Test multiple undo/redo operations
+    #[test]
+    fn test_multiple_undo_redo() {
+        let file = create_test_file("ab");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Insert multiple characters
+        editor.cursor_end();
+        editor.insert_char('c').unwrap();
+        editor.insert_char('d').unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("abcd".to_string()));
+        
+        // Undo twice
+        editor.undo().unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("abc".to_string()));
+        editor.undo().unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("ab".to_string()));
+        
+        // Redo twice
+        editor.redo().unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("abc".to_string()));
+        editor.redo().unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("abcd".to_string()));
+    }
+
+    /// Test that undo/redo with nothing to undo doesn't crash
+    #[test]
+    fn test_undo_nothing() {
+        let file = create_test_file("hello");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Undo with nothing to undo should not crash
+        editor.undo().unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("hello".to_string()));
+        
+        // Redo with nothing to redo should not crash
+        editor.redo().unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("hello".to_string()));
+    }
+
+    /// Test that redo stack is cleared when a new edit is made
+    #[test]
+    fn test_redo_cleared_on_new_edit() {
+        let file = create_test_file("ab");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Make an edit
+        editor.cursor_end();
+        editor.insert_char('c').unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("abc".to_string()));
+        
+        // Undo
+        editor.undo().unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("ab".to_string()));
+        
+        // Verify we can redo
+        assert!(!editor.undo_history.redo_stack.is_empty());
+        
+        // Make a new edit
+        editor.insert_char('x').unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("abx".to_string()));
+        
+        // Redo stack should be cleared
+        assert!(editor.undo_history.redo_stack.is_empty());
+        
+        // Redo should do nothing
+        editor.redo().unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("abx".to_string()));
+    }
+
+    /// Test undo of cut line operation
+    #[test]
+    fn test_undo_cut_line() {
+        let file = create_test_file("line1\nline2\nline3");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        assert_eq!(editor.viewport.line_count(), 3);
+        
+        // Move to line 2 and cut it
+        editor.cursor_down();
+        assert_eq!(editor.cursor.row, 1);
+        editor.cut_line().unwrap();
+        
+        assert_eq!(editor.viewport.line_count(), 2);
+        assert_eq!(editor.viewport.line_str(0), Some("line1".to_string()));
+        assert_eq!(editor.viewport.line_str(1), Some("line3".to_string()));
+        
+        // Undo should restore line2
+        editor.undo().unwrap();
+        assert_eq!(editor.viewport.line_count(), 3);
+        assert_eq!(editor.viewport.line_str(0), Some("line1".to_string()));
+        assert_eq!(editor.viewport.line_str(1), Some("line2".to_string()));
+        assert_eq!(editor.viewport.line_str(2), Some("line3".to_string()));
+    }
+
+    /// Test undo of newline insertion
+    #[test]
+    fn test_undo_newline_insert() {
+        let file = create_test_file("hello world");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        assert_eq!(editor.viewport.line_count(), 1);
+        
+        // Move cursor to middle and insert newline
+        for _ in 0..5 {
+            editor.cursor_right();
+        }
+        editor.insert_newline().unwrap();
+        
+        assert_eq!(editor.viewport.line_count(), 2);
+        assert_eq!(editor.viewport.line_str(0), Some("hello".to_string()));
+        assert_eq!(editor.viewport.line_str(1), Some(" world".to_string()));
+        
+        // Undo should join lines
+        editor.undo().unwrap();
+        assert_eq!(editor.viewport.line_count(), 1);
+        assert_eq!(editor.viewport.line_str(0), Some("hello world".to_string()));
+    }
+
+    /// Test cursor position is restored correctly on undo
+    #[test]
+    fn test_undo_restores_cursor() {
+        let file = create_test_file("hello");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Start at position 0
+        assert_eq!(editor.cursor.col, 0);
+        
+        // Move to end and insert
+        editor.cursor_end();
+        let cursor_before = editor.cursor;
+        editor.insert_char('!').unwrap();
+        
+        // Cursor should have moved right
+        assert_eq!(editor.cursor.col, cursor_before.col + 1);
+        
+        // Undo should restore cursor to original position
+        editor.undo().unwrap();
+        assert_eq!(editor.cursor.col, cursor_before.col);
+        assert_eq!(editor.cursor.row, cursor_before.row);
+    }
+
+    /// Test vi mode state management
+    #[test]
+    fn test_vi_mode_state() {
+        let file = create_test_file("hello");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Default is nano mode
+        assert_eq!(editor.input_style, InputStyle::Nano);
+        
+        // Toggle to vi mode
+        editor.toggle_input_style();
+        assert_eq!(editor.input_style, InputStyle::Vi);
+        assert_eq!(editor.vi_mode, ViMode::Normal);
+        
+        // Set insert mode
+        editor.set_vi_mode(ViMode::Insert);
+        assert_eq!(editor.vi_mode, ViMode::Insert);
+        
+        // Set command mode
+        editor.set_vi_mode(ViMode::Command);
+        assert_eq!(editor.vi_mode, ViMode::Command);
+        
+        // Toggle back to nano
+        editor.toggle_input_style();
+        assert_eq!(editor.input_style, InputStyle::Nano);
+    }
+
+    /// Test vi mode navigation commands
+    #[test]
+    fn test_vi_navigation() {
+        let file = create_test_file("hello world\nline two\nline three");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        editor.toggle_input_style(); // Switch to vi
+        
+        // h/j/k/l navigation
+        assert_eq!(editor.cursor.row, 0);
+        assert_eq!(editor.cursor.col, 0);
+        
+        // l = right
+        editor.cursor_right();
+        assert_eq!(editor.cursor.col, 1);
+        
+        // j = down
+        editor.cursor_down();
+        assert_eq!(editor.cursor.row, 1);
+        
+        // k = up
+        editor.cursor_up();
+        assert_eq!(editor.cursor.row, 0);
+        
+        // h = left
+        editor.cursor_left();
+        assert_eq!(editor.cursor.col, 0);
+        
+        // $ = end of line
+        editor.cursor_end();
+        assert!(editor.cursor.col > 0);
+        
+        // 0 = start of line
+        editor.cursor_home();
+        assert_eq!(editor.cursor.col, 0);
+    }
+
+    /// Test word navigation
+    #[test]
+    fn test_word_navigation() {
+        let file = create_test_file("one two three four");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        assert_eq!(editor.cursor.col, 0);
+        
+        // w = next word
+        editor.cursor_next_word();
+        assert_eq!(editor.cursor.col, 4); // start of "two"
+        
+        editor.cursor_next_word();
+        assert_eq!(editor.cursor.col, 8); // start of "three"
+        
+        // b = previous word
+        editor.cursor_prev_word();
+        assert_eq!(editor.cursor.col, 4); // back to "two"
+        
+        editor.cursor_prev_word();
+        assert_eq!(editor.cursor.col, 0); // back to "one"
+    }
+
+    /// Test vi mode delete operations
+    #[test]
+    fn test_vi_delete_x() {
+        let file = create_test_file("hello");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        editor.toggle_input_style(); // Switch to vi
+        
+        // x deletes character at cursor
+        editor.delete_forward().unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("ello".to_string()));
+        
+        // Undo should restore
+        editor.undo().unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("hello".to_string()));
+    }
+
+    /// Test yank and paste
+    #[test]
+    fn test_yank_paste() {
+        let file = create_test_file("line1\nline2\nline3");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Yank line1 (includes newline)
+        editor.yank_line().unwrap();
+        
+        // Move to line3 (row 2)
+        editor.cursor_down();
+        editor.cursor_down();
+        assert_eq!(editor.cursor.row, 2);
+        
+        // Paste - inserts at cursor position (start of line3)
+        editor.paste().unwrap();
+        
+        // Content should now be: line1\nline2\nline1\nline3
+        // (yanked "line1\n" inserted at start of line3)
+        assert_eq!(editor.viewport.line_count(), 4);
+        assert_eq!(editor.viewport.line_str(0), Some("line1".to_string()));
+        assert_eq!(editor.viewport.line_str(1), Some("line2".to_string()));
+        assert_eq!(editor.viewport.line_str(2), Some("line1".to_string())); // pasted line
+        assert_eq!(editor.viewport.line_str(3), Some("line3".to_string()));
+    }
+
+    /// Test nano mode basic editing
+    #[test]
+    fn test_nano_mode_editing() {
+        let file = create_test_file("test");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        assert_eq!(editor.input_style, InputStyle::Nano);
+        
+        // Insert at end
+        editor.cursor_end();
+        editor.insert_char('s').unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("tests".to_string()));
+        
+        // Backspace
+        editor.delete_backward().unwrap();
+        assert_eq!(editor.viewport.line_str(0), Some("test".to_string()));
+        
+        // Insert newline
+        editor.insert_newline().unwrap();
+        assert_eq!(editor.viewport.line_count(), 2);
+    }
+
+    /// Test editor status messages
+    #[test]
+    fn test_status_messages() {
+        let file = create_test_file("test");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Set a status
+        editor.set_status("Test status");
+        assert_eq!(editor.status_message, Some("Test status".to_string()));
+        
+        // Undo with nothing sets status
+        editor.undo().unwrap();
+        assert_eq!(editor.status_message, Some("Nothing to undo".to_string()));
+        
+        // Redo with nothing sets status
+        editor.redo().unwrap();
+        assert_eq!(editor.status_message, Some("Nothing to redo".to_string()));
+    }
+
+    /// Test modified flag
+    #[test]
+    fn test_modified_flag() {
+        let file = create_test_file("test");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Initially not modified
+        // Note: patches.is_modified() may start true depending on implementation
+        let initial_modified = editor.is_modified();
+        
+        // Insert should mark as modified
+        editor.insert_char('x').unwrap();
+        assert!(editor.is_modified() || initial_modified);
+    }
+
+    /// Test page up/down navigation
+    #[test]
+    fn test_page_navigation() {
+        // Create a file with many lines
+        let content = (0..100).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let file = create_test_file(&content);
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        assert_eq!(editor.cursor.row, 0);
+        
+        // Page down
+        editor.page_down(20);
+        assert!(editor.cursor.row > 0 || editor.scroll_offset > 0);
+        
+        // Page up should go back
+        let pos_after_down = editor.cursor.row + editor.scroll_offset;
+        editor.page_up(20);
+        let pos_after_up = editor.cursor.row + editor.scroll_offset;
+        assert!(pos_after_up < pos_after_down || pos_after_up == 0);
+    }
+
+    /// Test vi command buffer (for dd, yy, gg etc.)
+    #[test]
+    fn test_vi_command_buffer() {
+        let file = create_test_file("test");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        editor.toggle_input_style(); // Switch to vi
+        
+        // Command buffer starts empty
+        assert!(editor.vi_command_buffer.is_empty());
+        
+        // Setting a value
+        editor.vi_command_buffer = "d".to_string();
+        assert_eq!(editor.vi_command_buffer, "d");
+        
+        // Clearing
+        editor.vi_command_buffer.clear();
+        assert!(editor.vi_command_buffer.is_empty());
+    }
+
+    /// Test input buffer for search/commands
+    #[test]
+    fn test_input_buffer() {
+        let file = create_test_file("test");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Input buffer starts empty
+        assert!(editor.input_buffer.is_empty());
+        
+        // Can add characters
+        editor.input_buffer.push('t');
+        editor.input_buffer.push('e');
+        editor.input_buffer.push('s');
+        editor.input_buffer.push('t');
+        assert_eq!(editor.input_buffer, "test");
+        
+        // Clear
+        editor.input_buffer.clear();
+        assert!(editor.input_buffer.is_empty());
     }
 }

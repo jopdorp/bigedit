@@ -10,6 +10,8 @@
 
 - **Edit files larger than RAM** - Only loads what's visible on screen
 - **Nano-like keybindings** - Familiar interface for terminal users
+- **Vi mode** - Toggle with F2 for vi-style editing (h/j/k/l, i/a/o, :w/:q)
+- **Undo/Redo** - Full undo support (Ctrl+Z/Ctrl+Y in Nano, u/Ctrl+R in Vi)
 - **FUSE virtual filesystem** - Other programs can see your changes before you compact
 - **Journal-based saves** - Instant writes without rewriting the entire file
 - **Systemd service** - Auto-mount patched file views on boot

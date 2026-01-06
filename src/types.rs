@@ -339,6 +339,90 @@ impl CursorPos {
     }
 }
 
+use crate::patches::PatchList;
+
+/// An undoable operation for the undo/redo stack
+/// Stores the state needed to undo/redo operations by saving patch snapshots
+#[derive(Debug, Clone)]
+pub struct UndoOperation {
+    /// Cursor position before the operation
+    pub cursor_before: CursorPos,
+    /// Patches snapshot before the operation
+    pub patches_before: PatchList,
+    /// Base patches snapshot before the operation (for merged patches)
+    pub base_patches_before: PatchList,
+}
+
+/// Undo/redo history stack
+#[derive(Debug, Clone, Default)]
+pub struct UndoHistory {
+    /// Stack of operations that can be undone
+    pub undo_stack: Vec<UndoOperation>,
+    /// Stack of operations that can be redone
+    pub redo_stack: Vec<UndoOperation>,
+    /// Maximum number of undo operations to keep
+    pub max_size: usize,
+}
+
+impl UndoHistory {
+    pub fn new() -> Self {
+        Self {
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            max_size: 1000, // Reasonable default
+        }
+    }
+
+    /// Push an operation onto the undo stack
+    pub fn push(&mut self, op: UndoOperation) {
+        self.undo_stack.push(op);
+        // Clear redo stack when new operation is performed
+        self.redo_stack.clear();
+        // Trim if too large
+        if self.undo_stack.len() > self.max_size {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    /// Push directly onto the undo stack (without clearing redo)
+    pub fn push_undo(&mut self, op: UndoOperation) {
+        self.undo_stack.push(op);
+        // Trim if too large
+        if self.undo_stack.len() > self.max_size {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    /// Push directly onto the redo stack
+    pub fn push_redo(&mut self, op: UndoOperation) {
+        self.redo_stack.push(op);
+        // Trim if too large
+        if self.redo_stack.len() > self.max_size {
+            self.redo_stack.remove(0);
+        }
+    }
+
+    /// Pop from undo stack (caller manages redo stack)
+    pub fn undo(&mut self) -> Option<UndoOperation> {
+        self.undo_stack.pop()
+    }
+
+    /// Pop from redo stack (caller manages undo stack)
+    pub fn redo(&mut self) -> Option<UndoOperation> {
+        self.redo_stack.pop()
+    }
+
+    /// Check if undo is available
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    /// Check if redo is available
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+}
+
 /// Input style for the editor (Nano-like vs Vi-like keybindings)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InputStyle {
@@ -474,5 +558,132 @@ mod tests {
             }
             _ => panic!("Expected Inserted result"),
         }
+    }
+
+    #[test]
+    fn test_undo_history_new() {
+        let history = UndoHistory::new();
+        assert!(history.undo_stack.is_empty());
+        assert!(history.redo_stack.is_empty());
+        assert_eq!(history.max_size, 1000);
+    }
+
+    #[test]
+    fn test_undo_history_push() {
+        use crate::patches::PatchList;
+        
+        let mut history = UndoHistory::new();
+        
+        let op = UndoOperation {
+            cursor_before: CursorPos { row: 0, col: 0 },
+            patches_before: PatchList::new(),
+            base_patches_before: PatchList::new(),
+        };
+        
+        history.push(op);
+        
+        assert_eq!(history.undo_stack.len(), 1);
+        assert!(history.redo_stack.is_empty()); // push clears redo stack
+    }
+
+    #[test]
+    fn test_undo_history_push_clears_redo() {
+        use crate::patches::PatchList;
+        
+        let mut history = UndoHistory::new();
+        
+        // Add to redo stack directly
+        let op = UndoOperation {
+            cursor_before: CursorPos { row: 0, col: 0 },
+            patches_before: PatchList::new(),
+            base_patches_before: PatchList::new(),
+        };
+        history.push_redo(op.clone());
+        assert_eq!(history.redo_stack.len(), 1);
+        
+        // Push new operation - should clear redo
+        history.push(op);
+        assert!(history.redo_stack.is_empty());
+    }
+
+    #[test]
+    fn test_undo_history_undo_redo() {
+        use crate::patches::PatchList;
+        
+        let mut history = UndoHistory::new();
+        
+        let op = UndoOperation {
+            cursor_before: CursorPos { row: 1, col: 5 },
+            patches_before: PatchList::new(),
+            base_patches_before: PatchList::new(),
+        };
+        
+        history.push(op);
+        
+        // Undo should pop from undo stack
+        let undone = history.undo();
+        assert!(undone.is_some());
+        assert!(history.undo_stack.is_empty());
+        
+        // Calling undo again should return None
+        let undone2 = history.undo();
+        assert!(undone2.is_none());
+    }
+
+    #[test]
+    fn test_undo_history_push_undo_push_redo() {
+        use crate::patches::PatchList;
+        
+        let mut history = UndoHistory::new();
+        
+        let op = UndoOperation {
+            cursor_before: CursorPos { row: 0, col: 0 },
+            patches_before: PatchList::new(),
+            base_patches_before: PatchList::new(),
+        };
+        
+        // push_undo doesn't clear redo
+        history.push_redo(op.clone());
+        history.push_undo(op.clone());
+        
+        assert_eq!(history.undo_stack.len(), 1);
+        assert_eq!(history.redo_stack.len(), 1);
+    }
+
+    #[test]
+    fn test_cursor_pos_default() {
+        let cursor = CursorPos::default();
+        assert_eq!(cursor.row, 0);
+        assert_eq!(cursor.col, 0);
+    }
+
+    #[test]
+    fn test_input_style_default() {
+        let style = InputStyle::default();
+        assert_eq!(style, InputStyle::Nano);
+    }
+
+    #[test]
+    fn test_vi_mode_default() {
+        let mode = ViMode::default();
+        assert_eq!(mode, ViMode::Normal);
+    }
+
+    #[test]
+    fn test_editor_mode_default() {
+        let mode = EditorMode::default();
+        assert_eq!(mode, EditorMode::Normal);
+    }
+
+    #[test]
+    fn test_cut_buffer() {
+        let mut buffer = CutBuffer::new();
+        assert!(buffer.content.is_empty());
+        
+        buffer.set(b"hello".to_vec());
+        assert_eq!(buffer.get(), b"hello");
+        
+        buffer.clear();
+        assert!(buffer.content.is_empty());
     }
 }

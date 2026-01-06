@@ -39,6 +39,8 @@ Navigation:
 Editing:
   Ctrl+K        Cut current line
   Ctrl+U        Paste (uncut)
+  Ctrl+Z        Undo
+  Ctrl+Y        Redo
   Backspace     Delete char before cursor
   Delete        Delete char at cursor
 
@@ -60,7 +62,7 @@ Help:
   Esc           Cancel/close prompt
 
 Toggle Mode:
-  Ctrl+V        Switch to Vi mode
+  F2            Switch to Vi mode
 
 Press any key to close this help...
 "#;
@@ -78,7 +80,8 @@ NORMAL MODE:
   dd            Delete line
   yy            Yank (copy) line
   p             Paste after cursor
-  u             Undo (not implemented yet)
+  u             Undo
+  Ctrl+R        Redo
 
 INSERT MODE:
   i             Insert before cursor
@@ -92,6 +95,7 @@ COMMAND MODE (press : in normal mode):
   :q            Quit
   :wq           Save and quit
   :q!           Quit without saving
+  :help         Show this help
 
 SEARCH:
   /pattern      Search forward
@@ -99,7 +103,7 @@ SEARCH:
   N             Find previous
 
 Toggle Mode:
-  Ctrl+V        Switch to Nano mode
+  F2            Switch to Nano mode
 
 Press any key to close this help...
 "#;
@@ -324,6 +328,18 @@ impl App {
                 self.editor.set_status("Pasted");
             }
 
+            // Undo
+            (KeyModifiers::CONTROL, KeyCode::Char('z')) => {
+                self.editor.undo()?;
+                self.terminal.clear()?;
+            }
+
+            // Redo
+            (KeyModifiers::CONTROL, KeyCode::Char('y')) => {
+                self.editor.redo()?;
+                self.terminal.clear()?;
+            }
+
             // Navigation
             (KeyModifiers::NONE, KeyCode::Up) => self.editor.cursor_up(),
             (KeyModifiers::NONE, KeyCode::Down) => self.editor.cursor_down(),
@@ -516,6 +532,16 @@ impl App {
             (KeyModifiers::NONE, KeyCode::Char('p')) => {
                 self.editor.paste()?;
                 self.editor.set_status("Pasted");
+            }
+
+            // Undo/Redo
+            (KeyModifiers::NONE, KeyCode::Char('u')) => {
+                self.editor.undo()?;
+                self.terminal.clear()?;
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('r')) => {
+                self.editor.redo()?;
+                self.terminal.clear()?;
             }
 
             // Search
@@ -1205,5 +1231,146 @@ fn format_size(bytes: u64) -> String {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{EditorMode, InputStyle, ViMode};
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn create_test_file(content: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    /// Test format_size function
+    #[test]
+    fn test_format_size() {
+        assert_eq!(format_size(100), "100 B");
+        assert_eq!(format_size(1024), "1.00 KB");
+        assert_eq!(format_size(1024 * 1024), "1.00 MB");
+        assert_eq!(format_size(1024 * 1024 * 1024), "1.00 GB");
+        assert_eq!(format_size(1536), "1.50 KB");
+    }
+
+    /// Test cursor X calculation with ASCII
+    #[test]
+    fn test_cursor_x_ascii() {
+        let file = create_test_file("hello world");
+        let editor = Editor::open(file.path()).unwrap();
+        
+        // Create a mock area
+        let area = Rect::new(0, 0, 80, 24);
+        
+        // Cursor at start should be at area.x
+        let x = calculate_cursor_x(&editor, area);
+        assert_eq!(x, 0);
+    }
+
+    /// Test help text constants are not empty
+    #[test]
+    fn test_help_text_nano_exists() {
+        assert!(!HELP_TEXT_NANO.is_empty());
+        assert!(HELP_TEXT_NANO.contains("Nano Mode"));
+        assert!(HELP_TEXT_NANO.contains("Ctrl+Z"));  // Undo
+        assert!(HELP_TEXT_NANO.contains("Ctrl+Y"));  // Redo
+        assert!(HELP_TEXT_NANO.contains("Ctrl+X"));  // Exit
+        assert!(HELP_TEXT_NANO.contains("Ctrl+O"));  // Save
+        assert!(HELP_TEXT_NANO.contains("Ctrl+W"));  // Search
+    }
+
+    /// Test vi help text
+    #[test]
+    fn test_help_text_vi_exists() {
+        assert!(!HELP_TEXT_VI.is_empty());
+        assert!(HELP_TEXT_VI.contains("Vi Mode"));
+        assert!(HELP_TEXT_VI.contains("h/j/k/l"));  // Navigation
+        assert!(HELP_TEXT_VI.contains("INSERT MODE"));
+        assert!(HELP_TEXT_VI.contains("NORMAL MODE"));
+        assert!(HELP_TEXT_VI.contains(":w"));  // Save command
+        assert!(HELP_TEXT_VI.contains(":q"));  // Quit command
+        assert!(HELP_TEXT_VI.contains("u"));  // Undo
+        assert!(HELP_TEXT_VI.contains("Ctrl+R"));  // Redo
+    }
+
+    /// Test that EditorMode transitions work
+    #[test]
+    fn test_editor_modes() {
+        let file = create_test_file("test");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Default is Normal mode
+        assert_eq!(editor.mode, EditorMode::Normal);
+        
+        // Can switch to Help
+        editor.mode = EditorMode::Help;
+        assert_eq!(editor.mode, EditorMode::Help);
+        
+        // Can switch to Search
+        editor.mode = EditorMode::Search;
+        assert_eq!(editor.mode, EditorMode::Search);
+        
+        // Can switch to Exit
+        editor.mode = EditorMode::Exit;
+        assert_eq!(editor.mode, EditorMode::Exit);
+        
+        // Back to Normal
+        editor.mode = EditorMode::Normal;
+        assert_eq!(editor.mode, EditorMode::Normal);
+    }
+
+    /// Test InputStyle and ViMode interactions
+    #[test]
+    fn test_input_style_vi_mode() {
+        let file = create_test_file("test");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Switch to vi
+        editor.input_style = InputStyle::Vi;
+        editor.vi_mode = ViMode::Normal;
+        
+        // Can transition between vi modes
+        editor.set_vi_mode(ViMode::Insert);
+        assert_eq!(editor.vi_mode, ViMode::Insert);
+        
+        editor.set_vi_mode(ViMode::Command);
+        assert_eq!(editor.vi_mode, ViMode::Command);
+        
+        editor.set_vi_mode(ViMode::Normal);
+        assert_eq!(editor.vi_mode, ViMode::Normal);
+    }
+
+    /// Test toggle_input_style
+    #[test]
+    fn test_toggle_input_style() {
+        let file = create_test_file("test");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        assert_eq!(editor.input_style, InputStyle::Nano);
+        
+        editor.toggle_input_style();
+        assert_eq!(editor.input_style, InputStyle::Vi);
+        
+        editor.toggle_input_style();
+        assert_eq!(editor.input_style, InputStyle::Nano);
+    }
+
+    /// Test search query storage
+    #[test]
+    fn test_search_query_storage() {
+        let file = create_test_file("hello world hello");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Search query starts empty
+        assert!(editor.search_query.is_empty());
+        
+        // Set a search query
+        editor.search_query = "hello".to_string();
+        assert_eq!(editor.search_query, "hello");
     }
 }
