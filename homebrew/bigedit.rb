@@ -2,7 +2,7 @@ class Bigedit < Formula
   desc "Fast text editor for very large files using journaling and FUSE"
   homepage "https://github.com/jopdorp/bigedit"
   url "https://github.com/jopdorp/bigedit/archive/refs/tags/v0.1.7.tar.gz"
-  sha256 "PLACEHOLDER_SHA256"
+  sha256 "8390ca7b3d4eff90d7e519b8e0c8eee9955cb3d99b54e0d20e5c41bf270007ad"
   license "MIT"
   head "https://github.com/jopdorp/bigedit.git", branch: "master"
 
