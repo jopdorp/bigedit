@@ -39,8 +39,14 @@ pub fn has_fuse_overlayfs() -> bool {
 }
 
 /// Check if we have root privileges (for kernel overlayfs)
+#[cfg(target_os = "linux")]
 pub fn has_root() -> bool {
     unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn has_root() -> bool {
+    false
 }
 
 /// Check if overlay support is available
