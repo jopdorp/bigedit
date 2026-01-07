@@ -405,18 +405,21 @@ fn get_filesystem_type_linux(path: &Path) -> Option<String> {
 /// Get filesystem type on macOS
 #[cfg(target_os = "macos")]
 fn get_filesystem_type_macos(path: &Path) -> Option<String> {
-    use std::process::Command;
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
     
-    // Use diskutil to get filesystem type
-    let output = Command::new("diskutil")
-        .args(["info", "-plist"])
-        .arg(path)
-        .output()
-        .ok()?;
+    let path_cstr = CString::new(path.to_string_lossy().as_bytes()).ok()?;
     
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.contains("APFS") {
-        return Some("apfs".to_string());
+    unsafe {
+        let mut statfs_buf: MaybeUninit<libc::statfs> = MaybeUninit::uninit();
+        if libc::statfs(path_cstr.as_ptr(), statfs_buf.as_mut_ptr()) == 0 {
+            let statfs = statfs_buf.assume_init();
+            // f_fstypename contains the filesystem type as a C string on macOS
+            let fstype = std::ffi::CStr::from_ptr(statfs.f_fstypename.as_ptr())
+                .to_string_lossy()
+                .to_string();
+            return Some(fstype);
+        }
     }
     None
 }
