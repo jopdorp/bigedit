@@ -365,6 +365,66 @@ impl Editor {
         self.clamp_cursor_col();
     }
 
+    /// Go to a specific line number (1-indexed)
+    ///
+    /// Efficiently scans the file from the beginning to find the byte offset
+    /// of the target line, then loads the viewport at that position.
+    pub fn go_to_line(&mut self, line_num: usize) -> Result<()> {
+        if line_num == 0 {
+            self.set_status("Line number must be >= 1");
+            return Ok(());
+        }
+
+        // Line 1 is at offset 0
+        if line_num == 1 {
+            self.reload_viewport(0)?;
+            self.cursor.row = 0;
+            self.cursor.col = 0;
+            self.scroll_offset = 0;
+            self.set_status(format!("Line {}", line_num));
+            return Ok(());
+        }
+
+        // Scan the file to find the byte offset of line N
+        // We need to count (line_num - 1) newlines
+        let target_newlines = line_num - 1;
+        let mut newlines_found: usize = 0;
+        let mut byte_offset: u64 = 0;
+
+        // Read in chunks for efficiency
+        const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
+        let mut buffer = vec![0u8; CHUNK_SIZE];
+        let mut file = File::open(&self.path)?;
+
+        loop {
+            use std::io::Read;
+            let bytes_read = file.read(&mut buffer)?;
+            if bytes_read == 0 {
+                // Reached EOF before finding the line
+                self.set_status(format!("Line {} not found (file has {} lines)", line_num, newlines_found + 1));
+                return Ok(());
+            }
+
+            for i in 0..bytes_read {
+                if buffer[i] == b'\n' {
+                    newlines_found += 1;
+                    if newlines_found == target_newlines {
+                        // Found it! The target line starts at byte_offset + i + 1
+                        let target_offset = byte_offset + i as u64 + 1;
+                        self.reload_viewport(target_offset)?;
+                        self.cursor.row = 0;
+                        self.cursor.col = 0;
+                        self.scroll_offset = 0;
+                        self.set_status(format!("Line {}", line_num));
+                        return Ok(());
+                    }
+                }
+            }
+
+            byte_offset += bytes_read as u64;
+        }
+    }
+
     /// Clamp cursor column to current line length
     fn clamp_cursor_col(&mut self) {
         let max_col = self.current_line_grapheme_count();
@@ -2865,5 +2925,113 @@ mod tests {
         // Clear
         editor.input_buffer.clear();
         assert!(editor.input_buffer.is_empty());
+    }
+
+    /// Test go_to_line with line 1 (first line)
+    #[test]
+    fn test_go_to_line_first_line() {
+        let file = create_test_file("line1\nline2\nline3\nline4\nline5");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Start at a different position
+        editor.cursor.row = 2;
+        editor.cursor.col = 3;
+        
+        // Go to line 1
+        editor.go_to_line(1).unwrap();
+        
+        assert_eq!(editor.cursor.row, 0);
+        assert_eq!(editor.cursor.col, 0);
+        assert_eq!(editor.scroll_offset, 0);
+        assert_eq!(editor.viewport.line_str(0), Some("line1".to_string()));
+    }
+
+    /// Test go_to_line with middle line
+    #[test]
+    fn test_go_to_line_middle() {
+        let file = create_test_file("line1\nline2\nline3\nline4\nline5");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Go to line 3
+        editor.go_to_line(3).unwrap();
+        
+        assert_eq!(editor.cursor.row, 0);
+        assert_eq!(editor.cursor.col, 0);
+        // The viewport should start at line 3, so line_str(0) is "line3"
+        assert_eq!(editor.viewport.line_str(0), Some("line3".to_string()));
+    }
+
+    /// Test go_to_line with last line
+    #[test]
+    fn test_go_to_line_last() {
+        let file = create_test_file("line1\nline2\nline3\nline4\nline5");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Go to line 5 (last line)
+        editor.go_to_line(5).unwrap();
+        
+        assert_eq!(editor.cursor.row, 0);
+        assert_eq!(editor.cursor.col, 0);
+        assert_eq!(editor.viewport.line_str(0), Some("line5".to_string()));
+    }
+
+    /// Test go_to_line with invalid line 0
+    #[test]
+    fn test_go_to_line_zero() {
+        let file = create_test_file("line1\nline2\nline3");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        let original_row = editor.cursor.row;
+        
+        // Line 0 is invalid, should set status message but not change position
+        editor.go_to_line(0).unwrap();
+        
+        assert_eq!(editor.cursor.row, original_row);
+        assert!(editor.status_message.is_some());
+        assert!(editor.status_message.as_ref().unwrap().contains(">="));
+    }
+
+    /// Test go_to_line with line beyond file
+    #[test]
+    fn test_go_to_line_beyond_eof() {
+        let file = create_test_file("line1\nline2\nline3");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Try to go to line 100 (beyond EOF)
+        editor.go_to_line(100).unwrap();
+        
+        // Should set a status message indicating line not found
+        assert!(editor.status_message.is_some());
+        assert!(editor.status_message.as_ref().unwrap().contains("not found"));
+    }
+
+    /// Test go_to_line with empty lines
+    #[test]
+    fn test_go_to_line_with_empty_lines() {
+        let file = create_test_file("line1\n\n\nline4\nline5");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Go to line 4 (after empty lines)
+        editor.go_to_line(4).unwrap();
+        
+        assert_eq!(editor.cursor.row, 0);
+        assert_eq!(editor.viewport.line_str(0), Some("line4".to_string()));
+    }
+
+    /// Test go_to_line with single line file
+    #[test]
+    fn test_go_to_line_single_line() {
+        let file = create_test_file("only line");
+        let mut editor = Editor::open(file.path()).unwrap();
+        
+        // Go to line 1
+        editor.go_to_line(1).unwrap();
+        
+        assert_eq!(editor.cursor.row, 0);
+        assert_eq!(editor.viewport.line_str(0), Some("only line".to_string()));
+        
+        // Try line 2 (doesn't exist)
+        editor.go_to_line(2).unwrap();
+        assert!(editor.status_message.as_ref().unwrap().contains("not found"));
     }
 }

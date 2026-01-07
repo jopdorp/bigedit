@@ -36,6 +36,7 @@ Navigation:
   PgUp/PgDn     Page up/down
   Ctrl+Home     Go to start of file
   Ctrl+End      Go to end of file
+  Ctrl+_        Go to line number
 
 Editing:
   Ctrl+K        Cut current line
@@ -77,6 +78,7 @@ NORMAL MODE:
   w/b           Next/previous word
   0/$           Start/end of line
   gg/G          Start/end of file
+  Ngg           Go to line N (e.g., 100gg)
   x             Delete character
   dd            Delete line
   yy            Yank (copy) line
@@ -96,6 +98,7 @@ COMMAND MODE (press : in normal mode):
   :q            Quit
   :wq           Save and quit
   :q!           Quit without saving
+  :N            Go to line N (e.g., :100)
   :help         Show this help
 
 SEARCH:
@@ -181,10 +184,29 @@ impl App {
     /// Run the main event loop
     pub fn run(&mut self) -> Result<()> {
         while !self.should_quit {
+            self.ensure_cursor_visible();
             self.draw()?;
             self.handle_events()?;
         }
         Ok(())
+    }
+
+    /// Ensure cursor is visible by adjusting scroll_offset
+    fn ensure_cursor_visible(&mut self) {
+        // Get terminal height (approximate - we'll use actual during draw)
+        let height = self.terminal.size().map(|s| s.height.saturating_sub(2) as usize).unwrap_or(24);
+        
+        let cursor_row = self.editor.cursor.row;
+        let scroll = self.editor.scroll_offset;
+        
+        // If cursor is above visible area, scroll up
+        if cursor_row < scroll {
+            self.editor.scroll_offset = cursor_row;
+        }
+        // If cursor is below visible area, scroll down
+        else if cursor_row >= scroll + height {
+            self.editor.scroll_offset = cursor_row.saturating_sub(height - 1);
+        }
     }
 
     /// Draw the UI
@@ -261,6 +283,7 @@ impl App {
                     EditorMode::Save => self.handle_save_mode(key)?,
                     EditorMode::Help => self.handle_help_mode(key)?,
                     EditorMode::Exit => self.handle_exit_mode(key)?,
+                    EditorMode::GoToLine => self.handle_goto_line_mode(key)?,
                 }
             }
         }
@@ -301,6 +324,14 @@ impl App {
             // Help
             (KeyModifiers::CONTROL, KeyCode::Char('g')) => {
                 self.editor.mode = EditorMode::Help;
+            }
+
+            // Go to line (Ctrl+_ in nano, also support Ctrl+L)
+            (KeyModifiers::CONTROL, KeyCode::Char('_'))
+            | (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
+                self.editor.mode = EditorMode::GoToLine;
+                self.editor.input_buffer.clear();
+                self.editor.set_status("Go to line: ");
             }
 
             // Debug info
@@ -638,7 +669,19 @@ impl App {
 
     /// Execute a vi command (from command mode)
     fn execute_vi_command(&mut self, cmd: &str) -> Result<()> {
-        match cmd.trim() {
+        let cmd = cmd.trim();
+        
+        // Check if it's a line number command (just digits)
+        if let Ok(line_num) = cmd.parse::<usize>() {
+            if line_num > 0 {
+                self.editor.go_to_line(line_num)?;
+            } else {
+                self.editor.set_status("Invalid line number");
+            }
+            return Ok(());
+        }
+        
+        match cmd {
             "w" => {
                 self.save_file()?;
             }
@@ -747,6 +790,38 @@ impl App {
             KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Esc => {
                 self.editor.mode = EditorMode::Normal;
                 self.editor.clear_status();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Handle keypress in go-to-line mode
+    fn handle_goto_line_mode(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.editor.mode = EditorMode::Normal;
+                self.editor.clear_status();
+            }
+            KeyCode::Enter => {
+                self.editor.mode = EditorMode::Normal;
+                if let Ok(line_num) = self.editor.input_buffer.parse::<usize>() {
+                    if line_num > 0 {
+                        self.editor.go_to_line(line_num)?;
+                    } else {
+                        self.editor.set_status("Invalid line number");
+                    }
+                } else {
+                    self.editor.set_status("Invalid line number");
+                }
+            }
+            KeyCode::Backspace => {
+                self.editor.input_buffer.pop();
+                self.editor.set_status(format!("Go to line: {}", self.editor.input_buffer));
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                self.editor.input_buffer.push(c);
+                self.editor.set_status(format!("Go to line: {}", self.editor.input_buffer));
             }
             _ => {}
         }

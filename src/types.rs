@@ -450,6 +450,7 @@ pub enum EditorMode {
     Save,
     Help,
     Exit,
+    GoToLine,
 }
 
 /// A cut buffer for cut/paste operations
