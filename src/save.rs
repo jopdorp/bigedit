@@ -328,30 +328,25 @@ pub fn save_as(
 }
 
 // =============================================================================
-// Fast In-Place Consolidation using Filesystem-Level Operations
+// Fast Crash-Safe Consolidation using Copy-on-Write Filesystems
 // =============================================================================
 //
-// On ext4/XFS (Linux), we can use FALLOC_FL_INSERT_RANGE and FALLOC_FL_COLLAPSE_RANGE
-// to insert/delete space in files without rewriting unaffected regions.
-// This makes consolidation O(patches) instead of O(file_size).
+// On CoW filesystems (btrfs, ZFS, XFS with reflink, APFS), we can create an
+// instant backup via FICLONE/clonefile before modifying the file.
+// This provides crash-safety: if power fails mid-write, the backup is intact.
 //
-// On btrfs/APFS, we use reflinks/clonefile for efficient copy-on-write.
+// Strategy:
+// 1. CoW filesystems: FICLONE backup → stream rewrite → atomic rename
+// 2. Non-CoW (ext4, etc): Stream to temp file → atomic rename
 
 /// Filesystem capabilities for fast consolidation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilesystemCapability {
-    /// ext4: supports INSERT_RANGE and COLLAPSE_RANGE (no reflink backup)
-    ExtentManipulation,
-    /// XFS: supports BOTH reflink AND INSERT_RANGE/COLLAPSE_RANGE (best of both worlds)
-    ExtentManipulationWithReflink,
-    /// btrfs/ZFS/APFS: supports reflinks/clonefile (CoW) but no extent manipulation
+    /// btrfs/ZFS/XFS/APFS: supports reflinks/clonefile (instant backup)
     CopyOnWrite,
-    /// No special capabilities, use streaming rewrite
+    /// No CoW support, use temp file + atomic rename
     Standard,
 }
-
-/// Block size for extent operations (must align to this)
-const BLOCK_SIZE: u64 = 4096;
 
 /// Detect filesystem capabilities for the given path
 pub fn detect_filesystem_capability(path: &Path) -> FilesystemCapability {
@@ -360,12 +355,9 @@ pub fn detect_filesystem_capability(path: &Path) -> FilesystemCapability {
         // Try to detect filesystem type
         if let Some(fstype) = get_filesystem_type_linux(path) {
             match fstype.as_str() {
-                "ext4" => return FilesystemCapability::ExtentManipulation,
-                // XFS supports BOTH FICLONE (reflink) AND INSERT_RANGE/COLLAPSE_RANGE
-                // Best of both worlds: instant backup + O(patches) consolidation
-                "xfs" => return FilesystemCapability::ExtentManipulationWithReflink,
-                // btrfs and ZFS support reflink but not INSERT_RANGE
-                "btrfs" | "zfs" => return FilesystemCapability::CopyOnWrite,
+                // All these support FICLONE for instant CoW backup
+                "xfs" | "btrfs" | "zfs" => return FilesystemCapability::CopyOnWrite,
+                // ext4 doesn't support reflinks
                 _ => {}
             }
         }
@@ -433,9 +425,6 @@ fn get_filesystem_type_macos(path: &Path) -> Option<String> {
 // Background Defragmentation
 // =============================================================================
 
-/// Threshold: kick off background defrag after this many extent operations
-const DEFRAG_THRESHOLD_PATCHES: usize = 50;
-
 /// Kick off background defragmentation for a single file (Linux ext4/XFS only)
 /// 
 /// This spawns a detached process that will continue even if bigedit exits.
@@ -491,20 +480,6 @@ pub fn spawn_background_defrag(path: &Path) {
 pub fn spawn_background_defrag(_path: &Path) {
     // macOS APFS and btrfs handle fragmentation internally via CoW
     // No external defrag needed
-}
-
-/// Check if we should trigger background defrag based on patch count
-pub fn should_defrag(patch_count: usize) -> bool {
-    patch_count >= DEFRAG_THRESHOLD_PATCHES
-}
-
-/// Trigger background defrag if needed after consolidation
-/// 
-/// Call this after successful consolidation with INSERT_RANGE/COLLAPSE_RANGE
-pub fn maybe_defrag_after_consolidation(path: &Path, patch_count: usize) {
-    if should_defrag(patch_count) {
-        spawn_background_defrag(path);
-    }
 }
 
 // =============================================================================
@@ -596,22 +571,9 @@ impl BackgroundConsolidator {
         
         #[cfg(target_os = "linux")]
         {
-            match capability {
-                FilesystemCapability::ExtentManipulationWithReflink => {
-                    // XFS: Best of both worlds
-                    success = try_reflink_extent_consolidate_linux(path, patches)?;
-                }
-                FilesystemCapability::CopyOnWrite => {
-                    // btrfs/ZFS: FICLONE backup + streaming
-                    success = try_reflink_consolidate_linux(path, patches)?;
-                }
-                FilesystemCapability::ExtentManipulation => {
-                    // ext4: No FICLONE available, use crash-safe streaming
-                    // (temp file + atomic rename) instead of in-place extent ops
-                    // which are NOT crash-safe
-                    success = false; // Fall through to save_file
-                }
-                FilesystemCapability::Standard => {}
+            if capability == FilesystemCapability::CopyOnWrite {
+                // btrfs/ZFS/XFS: FICLONE backup + streaming
+                success = try_reflink_consolidate_linux(path, patches)?;
             }
         }
         
@@ -641,9 +603,8 @@ impl Default for BackgroundConsolidator {
 /// 
 /// **SAFETY**: This function NEVER modifies the original file in-place without backup.
 /// It always uses one of these safe strategies:
-/// 1. XFS: FICLONE backup + INSERT_RANGE/COLLAPSE_RANGE + cleanup (best of both worlds)
-/// 2. btrfs/ZFS/APFS: FICLONE backup + streaming rewrite + cleanup
-/// 3. ext4/Standard: streaming rewrite (temp file + atomic rename) - crash-safe
+/// 1. CoW filesystems (btrfs/ZFS/XFS/APFS): FICLONE backup + streaming rewrite + cleanup
+/// 2. Non-CoW (ext4/Standard): streaming rewrite (temp file + atomic rename)
 /// 
 /// Returns Ok(true) if fast consolidation was used, Ok(false) if caller should
 /// fall back to streaming rewrite.
@@ -654,280 +615,28 @@ pub fn try_fast_consolidate(path: &Path, patches: &PatchList) -> Result<bool> {
     
     let capability = detect_filesystem_capability(path);
     
-    match capability {
-        FilesystemCapability::ExtentManipulationWithReflink => {
-            // XFS: Best of both worlds - FICLONE backup + INSERT_RANGE/COLLAPSE_RANGE
-            #[cfg(target_os = "linux")]
-            {
-                if try_reflink_extent_consolidate_linux(path, patches)? {
-                    return Ok(true);
-                }
+    if capability == FilesystemCapability::CopyOnWrite {
+        #[cfg(target_os = "linux")]
+        {
+            if try_reflink_consolidate_linux(path, patches)? {
+                return Ok(true);
             }
         }
-        FilesystemCapability::ExtentManipulation => {
-            // ext4: No FICLONE backup, fall through to streaming (crash-safe)
-            // INSERT_RANGE is NOT crash-safe without backup
+        
+        #[cfg(target_os = "macos")]
+        {
+            if try_clonefile_consolidate_macos(path, patches)? {
+                return Ok(true);
+            }
         }
-        FilesystemCapability::CopyOnWrite => {
-            // btrfs/ZFS: FICLONE backup + streaming rewrite
-            // Handled by smart_consolidate, fall through
-        }
-        FilesystemCapability::Standard => {}
     }
     
     Ok(false) // Caller should use streaming rewrite
 }
 
-/// Linux ext4/XFS: Use INSERT_RANGE and COLLAPSE_RANGE for in-place consolidation
-#[cfg(target_os = "linux")]
-fn try_extent_consolidate_linux(path: &Path, patches: &PatchList) -> Result<bool> {
-    use std::os::unix::io::AsRawFd;
-    
-    const FALLOC_FL_COLLAPSE_RANGE: i32 = 0x08;
-    const FALLOC_FL_INSERT_RANGE: i32 = 0x20;
-    
-    let sorted_patches = patches.patches();
-    if sorted_patches.is_empty() {
-        return Ok(true);
-    }
-    
-    // Check if patches are block-aligned (required for INSERT/COLLAPSE_RANGE)
-    // If not, we need to handle sub-block regions differently
-    let mut can_use_extent_ops = true;
-    for patch in sorted_patches {
-        let old_len = patch.end - patch.start;
-        let new_len = patch.replacement.len() as u64;
-        let delta = new_len as i64 - old_len as i64;
-        
-        // Extent operations only work at block boundaries
-        if delta != 0 && (delta.unsigned_abs() % BLOCK_SIZE != 0) {
-            can_use_extent_ops = false;
-            break;
-        }
-    }
-    
-    if !can_use_extent_ops {
-        // Fall back to hybrid approach: extent ops for large changes, 
-        // regular writes for sub-block changes
-        return try_hybrid_consolidate_linux(path, patches);
-    }
-    
-    // Open file for modification
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .context("Failed to open file for consolidation")?;
-    let fd = file.as_raw_fd();
-    
-    // Process patches in reverse order to avoid offset shifting issues
-    let mut patches_vec: Vec<_> = sorted_patches.iter().collect();
-    patches_vec.sort_by(|a, b| b.start.cmp(&a.start)); // Reverse order
-    
-    for patch in patches_vec {
-        let old_len = patch.end - patch.start;
-        let new_len = patch.replacement.len() as u64;
-        
-        if new_len > old_len {
-            // Insertion: need to make space
-            let insert_len = new_len - old_len;
-            let insert_offset = (patch.start / BLOCK_SIZE) * BLOCK_SIZE; // Align down
-            
-            let result = unsafe {
-                libc::fallocate(fd, FALLOC_FL_INSERT_RANGE, insert_offset as i64, insert_len as i64)
-            };
-            
-            if result != 0 {
-                // INSERT_RANGE failed, fall back
-                return Ok(false);
-            }
-        } else if new_len < old_len {
-            // Deletion: need to collapse space
-            let collapse_len = old_len - new_len;
-            let collapse_offset = ((patch.start + new_len) / BLOCK_SIZE) * BLOCK_SIZE; // Align
-            
-            let result = unsafe {
-                libc::fallocate(fd, FALLOC_FL_COLLAPSE_RANGE, collapse_offset as i64, collapse_len as i64)
-            };
-            
-            if result != 0 {
-                // COLLAPSE_RANGE failed, fall back
-                return Ok(false);
-            }
-        }
-        
-        // Write the replacement data
-        if !patch.replacement.is_empty() {
-            use std::os::unix::fs::FileExt;
-            file.write_at(&patch.replacement, patch.start)
-                .context("Failed to write patch data")?;
-        }
-    }
-    
-    file.sync_all().context("Failed to sync file")?;
-    
-    // Kick off background defrag if we did many extent operations
-    let patch_count = sorted_patches.len();
-    maybe_defrag_after_consolidation(path, patch_count);
-    
-    Ok(true)
-}
-
-/// Hybrid consolidation: combine extent ops with sub-block rewrites
-#[cfg(target_os = "linux")]
-fn try_hybrid_consolidate_linux(path: &Path, patches: &PatchList) -> Result<bool> {
-    // For patches that don't align to blocks, we need a smarter approach:
-    // 1. Group patches into block-aligned regions
-    // 2. For regions that grow/shrink by full blocks, use INSERT/COLLAPSE
-    // 3. For remaining regions, do in-place rewrite with read-modify-write
-    
-    // For now, fall back to standard streaming rewrite
-    // This is a complex optimization that can be added later
-    Ok(false)
-}
-
-/// XFS: Best of both worlds - FICLONE backup + INSERT_RANGE/COLLAPSE_RANGE
-/// 
-/// Strategy:
-/// 1. FICLONE the original (instant CoW backup)
-/// 2. Use INSERT_RANGE/COLLAPSE_RANGE for O(patches) in-place modification
-/// 3. On success: delete backup
-/// 4. On failure: restore from backup
-/// 
-/// This gives XFS the instant backup safety of btrfs PLUS the O(patches)
-/// performance of ext4's extent operations.
-#[cfg(target_os = "linux")]
-fn try_reflink_extent_consolidate_linux(path: &Path, patches: &PatchList) -> Result<bool> {
-    use std::os::unix::io::AsRawFd;
-    
-    // First, check if patches are block-aligned (required for INSERT/COLLAPSE_RANGE)
-    let sorted_patches = patches.patches();
-    if sorted_patches.is_empty() {
-        return Ok(true);
-    }
-    
-    let mut can_use_extent_ops = true;
-    for patch in sorted_patches {
-        let old_len = patch.end - patch.start;
-        let new_len = patch.replacement.len() as u64;
-        let delta = new_len as i64 - old_len as i64;
-        
-        // Extent operations only work at block boundaries
-        if delta != 0 && (delta.unsigned_abs() % BLOCK_SIZE != 0) {
-            can_use_extent_ops = false;
-            break;
-        }
-    }
-    
-    if !can_use_extent_ops {
-        // Fall back to FICLONE + streaming (still safe, just O(file_size))
-        return try_reflink_consolidate_linux(path, patches);
-    }
-    
-    // Create backup path (instant CoW clone)
-    let backup_path = path.with_extension("bigedit-backup");
-    let _ = std::fs::remove_file(&backup_path);
-    
-    // FICLONE the original to backup (instant on XFS with reflink)
-    {
-        let src = File::open(path).context("Failed to open source for FICLONE")?;
-        let dst = File::create(&backup_path).context("Failed to create backup")?;
-        
-        let result = unsafe {
-            libc::ioctl(dst.as_raw_fd(), FICLONE, src.as_raw_fd())
-        };
-        
-        if result != 0 {
-            // FICLONE failed (maybe old XFS without reflink), fall back to streaming
-            let _ = std::fs::remove_file(&backup_path);
-            return try_reflink_consolidate_linux(path, patches);
-        }
-    }
-    
-    // Now do extent operations on the original (we have instant backup)
-    const FALLOC_FL_COLLAPSE_RANGE: i32 = 0x08;
-    const FALLOC_FL_INSERT_RANGE: i32 = 0x20;
-    
-    let result = (|| -> Result<()> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .context("Failed to open file for extent consolidation")?;
-        let fd = file.as_raw_fd();
-        
-        // Process patches in reverse order to avoid offset shifting issues
-        let mut patches_vec: Vec<_> = sorted_patches.iter().collect();
-        patches_vec.sort_by(|a, b| b.start.cmp(&a.start)); // Reverse order
-        
-        for patch in patches_vec {
-            let old_len = patch.end - patch.start;
-            let new_len = patch.replacement.len() as u64;
-            
-            if new_len > old_len {
-                // Insertion: need to make space
-                let insert_len = new_len - old_len;
-                let insert_offset = (patch.start / BLOCK_SIZE) * BLOCK_SIZE; // Align down
-                
-                let result = unsafe {
-                    libc::fallocate(fd, FALLOC_FL_INSERT_RANGE, insert_offset as i64, insert_len as i64)
-                };
-                
-                if result != 0 {
-                    bail!("INSERT_RANGE failed: {}", std::io::Error::last_os_error());
-                }
-            } else if new_len < old_len {
-                // Deletion: need to collapse space
-                let collapse_len = old_len - new_len;
-                let collapse_offset = ((patch.start + new_len) / BLOCK_SIZE) * BLOCK_SIZE;
-                
-                let result = unsafe {
-                    libc::fallocate(fd, FALLOC_FL_COLLAPSE_RANGE, collapse_offset as i64, collapse_len as i64)
-                };
-                
-                if result != 0 {
-                    bail!("COLLAPSE_RANGE failed: {}", std::io::Error::last_os_error());
-                }
-            }
-            
-            // Write the replacement data
-            if !patch.replacement.is_empty() {
-                use std::os::unix::fs::FileExt;
-                file.write_at(&patch.replacement, patch.start)
-                    .context("Failed to write patch data")?;
-            }
-        }
-        
-        file.sync_all().context("Failed to sync file")?;
-        Ok(())
-    })();
-    
-    match result {
-        Ok(()) => {
-            // Success - remove the backup
-            let _ = std::fs::remove_file(&backup_path);
-            
-            // Kick off background defrag if we did many extent operations
-            let patch_count = sorted_patches.len();
-            maybe_defrag_after_consolidation(path, patch_count);
-            
-            Ok(true)
-        }
-        Err(e) => {
-            // Failed - restore from backup
-            eprintln!("[xfs] Extent consolidation failed, restoring from backup: {}", e);
-            let _ = std::fs::rename(&backup_path, path);
-            Err(e)
-        }
-    }
-}
-
 // =============================================================================
 // Smart Consolidation Strategy
 // =============================================================================
-
-/// Estimated time in milliseconds for a single extent operation
-const EXTENT_OP_TIME_MS: u64 = 5;
 
 /// Estimated streaming rewrite speed in bytes per second (conservative SSD estimate)
 const STREAM_SPEED_BYTES_PER_SEC: u64 = 500 * 1024 * 1024; // 500 MB/s
@@ -941,9 +650,7 @@ const FAST_THRESHOLD_MS: u64 = 2000;
 /// Consolidation strategy based on file size and patch patterns
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsolidationStrategy {
-    /// Use INSERT_RANGE/COLLAPSE_RANGE (ext4/XFS) - O(patches)
-    ExtentOperations,
-    /// Use reflink/clonefile + modify (btrfs/APFS) - fast CoW
+    /// Use reflink/clonefile + modify (btrfs/XFS/ZFS/APFS) - fast CoW backup
     CloneAndModify,
     /// Traditional streaming rewrite - O(file_size)
     StreamingRewrite,
@@ -966,28 +673,6 @@ pub struct ConsolidationEstimate {
     pub recommend_background: bool,
 }
 
-/// Estimate the number of extent operations needed for patches
-fn estimate_extent_operations(patches: &PatchList) -> usize {
-    let sorted = patches.patches();
-    let mut ops = 0;
-    
-    for patch in sorted {
-        let old_len = patch.end - patch.start;
-        let new_len = patch.replacement.len() as u64;
-        
-        if new_len != old_len {
-            // Size change requires INSERT or COLLAPSE operation
-            ops += 1;
-        }
-        if !patch.replacement.is_empty() {
-            // Writing data (not counted in extent ops, but fast)
-        }
-    }
-    
-    // Add overhead for sub-block alignment handling
-    ops
-}
-
 /// Choose the best consolidation strategy for given file and patches
 pub fn choose_consolidation_strategy(
     path: &Path, 
@@ -1005,40 +690,21 @@ pub fn choose_consolidation_strategy(
     }
     
     let capability = detect_filesystem_capability(path);
-    let patch_count = patches.patches().len();
     
-    // Estimate times for each strategy
-    let extent_ops = estimate_extent_operations(patches);
-    let extent_time_ms = extent_ops as u64 * EXTENT_OP_TIME_MS;
+    // Estimate streaming time
     let stream_time_ms = (file_size * 1000) / STREAM_SPEED_BYTES_PER_SEC;
     
     // For CoW filesystems, cloning is nearly instant, then we stream-modify
-    // Still O(file_size) but with CoW benefits for unchanged regions
-    let cow_time_ms = stream_time_ms; // Conservative estimate
+    // Still O(file_size) but with instant crash-safe backup
+    let cow_time_ms = stream_time_ms; // Conservative estimate (clone is ~instant)
     
     let (strategy, time_ms) = match capability {
-        FilesystemCapability::ExtentManipulationWithReflink => {
-            // XFS: Best of both worlds - FICLONE backup + extent ops
-            // Time = backup (instant) + extent ops
-            if extent_time_ms < stream_time_ms {
-                (ConsolidationStrategy::ExtentOperations, extent_time_ms)
-            } else {
-                (ConsolidationStrategy::CloneAndModify, cow_time_ms)
-            }
-        }
-        FilesystemCapability::ExtentManipulation => {
-            // ext4: Use extent ops if faster than streaming
-            if extent_time_ms < stream_time_ms {
-                (ConsolidationStrategy::ExtentOperations, extent_time_ms)
-            } else {
-                (ConsolidationStrategy::StreamingRewrite, stream_time_ms)
-            }
-        }
         FilesystemCapability::CopyOnWrite => {
-            // btrfs/ZFS/APFS: Use clone+modify
+            // btrfs/ZFS/XFS/APFS: Use FICLONE backup + stream rewrite
             (ConsolidationStrategy::CloneAndModify, cow_time_ms)
         }
         FilesystemCapability::Standard => {
+            // ext4 and others: Stream to temp file + atomic rename
             (ConsolidationStrategy::StreamingRewrite, stream_time_ms)
         }
     };
@@ -1063,13 +729,6 @@ pub fn smart_consolidate(path: &Path, patches: &PatchList) -> Result<Consolidati
     match estimate.strategy {
         ConsolidationStrategy::NoOp => {
             // Nothing to do
-        }
-        ConsolidationStrategy::ExtentOperations => {
-            // Try extent-based consolidation (ext4/XFS)
-            if !try_fast_consolidate(path, patches)? {
-                // Fall back to streaming
-                save_file(path, patches, None)?;
-            }
         }
         ConsolidationStrategy::CloneAndModify => {
             // Use clone+modify approach for CoW filesystems
@@ -1372,15 +1031,13 @@ mod tests {
         let path = create_test_file(dir.path(), "test.txt", "hello");
         
         let capability = detect_filesystem_capability(&path);
-        // On Linux ext4, this should be ExtentManipulation
-        // The test just verifies the function doesn't crash
+        // Just verifies the function doesn't crash
         println!("Detected filesystem capability: {:?}", capability);
         
         // Verify it returns a valid value
         assert!(matches!(
             capability,
-            FilesystemCapability::ExtentManipulation 
-            | FilesystemCapability::CopyOnWrite 
+            FilesystemCapability::CopyOnWrite 
             | FilesystemCapability::Standard
         ));
     }
@@ -1429,12 +1086,11 @@ mod tests {
         let estimate = choose_consolidation_strategy(&path, 1024, &patches);
         assert!(estimate.is_instant, "Small file should be instant");
         
-        // Large file (10GB) with few patches on ext4 = extent ops preferred
+        // Large file (10GB) with few patches = should estimate time
         let estimate = choose_consolidation_strategy(&path, 10 * 1024 * 1024 * 1024, &patches);
         println!("10GB file, 1 patch: {:?}, {}ms", estimate.strategy, estimate.estimated_time_ms);
-        // On ext4, should prefer extent operations
-        // On other filesystems, may use streaming but should estimate time correctly
-        assert!(estimate.estimated_time_ms > 0 || estimate.strategy == ConsolidationStrategy::ExtentOperations);
+        // Should estimate time correctly (10GB / 500MB/s = ~20s)
+        assert!(estimate.estimated_time_ms > 0);
     }
     
     #[test]
@@ -1452,29 +1108,6 @@ mod tests {
         // Verify the file was modified correctly
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content, "hello beautiful world");
-    }
-    
-    #[test]
-    fn test_estimate_extent_operations() {
-        // No size change = no extent ops
-        let mut patches = PatchList::new();
-        patches.replace(0, 5, b"hello"); // Same length
-        let ops = estimate_extent_operations(&patches);
-        assert_eq!(ops, 0, "Same-length replacement needs no extent ops");
-        
-        // Insertion needs extent op
-        let mut patches = PatchList::new();
-        patches.insert(5, b" world");
-        let ops = estimate_extent_operations(&patches);
-        assert_eq!(ops, 1, "Insertion needs 1 extent op");
-        
-        // Multiple insertions
-        let mut patches = PatchList::new();
-        patches.insert(0, b"start ");
-        patches.insert(100, b" middle");
-        patches.insert(200, b" end");
-        let ops = estimate_extent_operations(&patches);
-        assert_eq!(ops, 3, "3 insertions need 3 extent ops");
     }
     
     /// Test btrfs reflink consolidation
@@ -1691,12 +1324,12 @@ mod tests {
         // Verify filesystem capability
         let capability = detect_filesystem_capability(&xfs_path);
         println!("Detected capability for {:?}: {:?}", xfs_path, capability);
-        assert_eq!(capability, FilesystemCapability::ExtentManipulationWithReflink, 
+        assert_eq!(capability, FilesystemCapability::CopyOnWrite, 
             "Expected XFS with reflink support");
         
         // Create test file
         let test_file = xfs_path.join("xfs_test.txt");
-        fs::write(&test_file, "Hello World! This is a test file for XFS reflink + extent consolidation.").unwrap();
+        fs::write(&test_file, "Hello World! This is a test file for XFS reflink consolidation.").unwrap();
         println!("Created test file: {:?}", test_file);
         
         // Test FICLONE
@@ -1725,17 +1358,17 @@ mod tests {
         }
         fs::remove_file(&clone_file).ok();
         
-        // Test reflink + extent consolidation
-        println!("\n--- Reflink + Extent Consolidation Test ---");
+        // Test reflink consolidation (streaming with FICLONE backup)
+        println!("\n--- Reflink Consolidation Test ---");
         let mut patches = PatchList::new();
         patches.replace(0, 5, b"HELLO");  // Replace "Hello" with "HELLO"
         patches.insert(12, b" INSERTED");  // Insert after "World!"
         
-        let result = try_reflink_extent_consolidate_linux(&test_file, &patches);
+        let result = try_reflink_consolidate_linux(&test_file, &patches);
         match result {
-            Ok(true) => println!("✓ Reflink + extent consolidation succeeded"),
-            Ok(false) => println!("○ Fell back to streaming (patches not block-aligned)"),
-            Err(e) => println!("○ Consolidation error (expected for non-aligned): {}", e),
+            Ok(true) => println!("✓ Reflink consolidation succeeded"),
+            Ok(false) => println!("○ Fell back to streaming"),
+            Err(e) => println!("○ Consolidation error: {}", e),
         }
         
         // Verify content
@@ -1805,7 +1438,7 @@ mod tests {
         let ficlone_time = start.elapsed();
         println!("{:>12?}  (instant CoW backup)", ficlone_time);
         
-        // Benchmark 2: Reflink + extent consolidation
+        // Benchmark 2: Reflink consolidation (FICLONE backup + streaming rewrite)
         let consolidate_path = xfs_path.join("bench_consolidate.txt");
         let _ = fs::remove_file(&consolidate_path);
         fs::copy(&test_file, &consolidate_path).unwrap();
@@ -1814,14 +1447,14 @@ mod tests {
         patches.replace(0, 8, b"REPLACED");
         patches.insert(1000, b"INSERTED TEXT HERE");
         
-        print!("Reflink+extent consolidate... ");
+        print!("Reflink consolidation...    ");
         let start = Instant::now();
-        let result = try_reflink_extent_consolidate_linux(&consolidate_path, &patches);
-        let extent_time = start.elapsed();
+        let result = try_reflink_consolidate_linux(&consolidate_path, &patches);
+        let consolidate_time = start.elapsed();
         
         match result {
-            Ok(true) => println!("{:>12?}  (FICLONE + extent ops)", extent_time),
-            Ok(false) => println!("{:>12?}  (fallback to stream)", extent_time),
+            Ok(true) => println!("{:>12?}  (FICLONE backup + stream)", consolidate_time),
+            Ok(false) => println!("{:>12?}  (fallback to stream)", consolidate_time),
             Err(e) => println!("ERROR: {}", e),
         }
         
@@ -1842,12 +1475,8 @@ mod tests {
         
         // Summary
         println!("\n=== Summary ===");
-        println!("FICLONE backup: {:?} (instant)", ficlone_time);
-        if extent_time < stream_time {
-            println!("XFS extent ops: {:.1}x faster than streaming!", 
-                stream_time.as_secs_f64() / extent_time.as_secs_f64());
-        }
-        println!("XFS provides: instant backup + O(patches) for block-aligned changes");
+        println!("FICLONE backup: {:?} (instant CoW backup)", ficlone_time);
+        println!("XFS provides: instant crash-safe backup via FICLONE");
         
         // Cleanup
         fs::remove_file(&backup_path).ok();
@@ -2020,7 +1649,7 @@ mod tests {
         fs::remove_file(&stream_path).ok();
     }
     
-    /// Test ext4 extent operations (INSERT_RANGE/COLLAPSE_RANGE)
+    /// Test ext4 consolidation
     /// Run with: EXT4_TEST_PATH=/tmp/ext4-mnt cargo test test_ext4 -- --nocapture --ignored
     #[test]
     #[ignore] // Requires mounted ext4 filesystem
@@ -2033,38 +1662,40 @@ mod tests {
             }
         };
         
-        // Verify filesystem capability
+        // Verify filesystem capability - ext4 should be Standard (no CoW)
         let capability = detect_filesystem_capability(&ext4_path);
         println!("Detected capability for {:?}: {:?}", ext4_path, capability);
-        assert_eq!(capability, FilesystemCapability::ExtentManipulation, 
-            "Expected ext4 with extent manipulation support");
+        assert_eq!(capability, FilesystemCapability::Standard, 
+            "Expected ext4 as Standard (no CoW support)");
         
         // Create test file
         let test_file = ext4_path.join("ext4_test.txt");
-        fs::write(&test_file, "Hello World! This is a test file for ext4 extent consolidation.").unwrap();
+        fs::write(&test_file, "Hello World! This is a test file for ext4 consolidation.").unwrap();
         println!("Created test file: {:?}", test_file);
         
-        // Test extent consolidation (note: ext4 does NOT support FICLONE)
-        println!("\n--- Extent Consolidation Test ---");
+        // Test streaming consolidation - ext4 uses temp file + atomic rename
+        println!("\n--- Streaming Consolidation Test ---");
         let mut patches = PatchList::new();
         patches.replace(0, 5, b"HELLO");  // Replace "Hello" with "HELLO"
         
-        // ext4 extent ops require block alignment, so this will likely fall back
-        let result = try_extent_consolidate_linux(&test_file, &patches);
+        let result = try_fast_consolidate(&test_file, &patches);
         match result {
-            Ok(true) => println!("✓ Extent consolidation succeeded"),
-            Ok(false) => println!("○ Fell back (patches not block-aligned)"),
+            Ok(true) => println!("✓ Fast consolidation succeeded"),
+            Ok(false) => println!("○ Fast consolidation returned false (expected for ext4)"),
             Err(e) => println!("○ Error: {}", e),
         }
         
+        // Always works via streaming fallback
+        save_file(&test_file, &patches, None).unwrap();
         let content = fs::read_to_string(&test_file).unwrap();
         println!("Final content: {}", content);
+        assert!(content.starts_with("HELLO"));
         
         fs::remove_file(&test_file).ok();
         println!("✓ ext4 test complete");
     }
-    
-    /// Benchmark ext4 extent operations
+
+    /// Benchmark ext4 streaming performance
     /// Run with: EXT4_TEST_PATH=/tmp/ext4-mnt cargo test bench_ext4 -- --nocapture --ignored
     #[test]
     #[ignore] // Requires mounted ext4 filesystem with test file
@@ -2088,37 +1719,17 @@ mod tests {
         }
         
         let file_size = fs::metadata(&test_file).unwrap().len();
-        println!("\n=== ext4 Extent Operations Benchmark ===");
+        println!("\n=== ext4 Streaming Benchmark ===");
         println!("Test file: {:?}", test_file);
         println!("File size: {:.1} MB", file_size as f64 / 1_000_000.0);
         println!();
         
         let capability = detect_filesystem_capability(&ext4_path);
         println!("Filesystem capability: {:?}", capability);
-        println!("Note: ext4 does NOT support FICLONE (no instant backup)");
+        println!("Note: ext4 does NOT support FICLONE - uses temp file + atomic rename");
         println!();
         
-        // Benchmark 1: Extent consolidation (block-aligned patches only)
-        let consolidate_path = ext4_path.join("bench_consolidate.txt");
-        let _ = fs::remove_file(&consolidate_path);
-        fs::copy(&test_file, &consolidate_path).unwrap();
-        
-        let mut patches = PatchList::new();
-        patches.replace(0, 8, b"REPLACED");
-        patches.insert(1000, b"INSERTED TEXT HERE");
-        
-        print!("Extent consolidation...   ");
-        let start = Instant::now();
-        let result = try_extent_consolidate_linux(&consolidate_path, &patches);
-        let extent_time = start.elapsed();
-        
-        match result {
-            Ok(true) => println!("{:>12?}  (INSERT/COLLAPSE_RANGE)", extent_time),
-            Ok(false) => println!("{:>12?}  (fallback - not block-aligned)", extent_time),
-            Err(e) => println!("ERROR: {}", e),
-        }
-        
-        // Benchmark 2: Plain streaming rewrite
+        // Benchmark streaming rewrite
         let stream_path = ext4_path.join("bench_stream.txt");
         let _ = fs::remove_file(&stream_path);
         
@@ -2126,7 +1737,7 @@ mod tests {
         patches.replace(0, 8, b"REPLACED");
         patches.insert(1000, b"INSERTED TEXT HERE");
         
-        print!("Plain streaming...        ");
+        print!("Streaming rewrite...      ");
         let start = Instant::now();
         save_file(&test_file, &patches, Some(&stream_path)).unwrap();
         let stream_time = start.elapsed();
@@ -2134,11 +1745,9 @@ mod tests {
         println!("{:>12?}  ({:.2} GB/s)", stream_time, stream_speed);
         
         println!("\n=== Summary ===");
-        println!("ext4 provides INSERT_RANGE/COLLAPSE_RANGE for block-aligned patches.");
-        println!("For non-block-aligned patches, falls back to streaming rewrite.");
-        println!("⚠️  No FICLONE support - no instant backup (less crash-safe than XFS/btrfs/ZFS)");
+        println!("ext4 uses temp file + atomic rename for crash safety.");
+        println!("No instant backup like CoW filesystems - full file rewrite required.");
         
-        fs::remove_file(&consolidate_path).ok();
         fs::remove_file(&stream_path).ok();
     }
     
@@ -2198,14 +1807,14 @@ mod tests {
                 img_path: "/tmp/bench-xfs.img", 
                 mnt_path: "/tmp/bench-xfs",
                 create_cmd: "mkfs.xfs -f -m reflink=1",
-                expected_capability: FilesystemCapability::ExtentManipulationWithReflink,
+                expected_capability: FilesystemCapability::CopyOnWrite,
             },
             FsConfig {
                 name: "ext4",
                 img_path: "/tmp/bench-ext4.img",
                 mnt_path: "/tmp/bench-ext4", 
                 create_cmd: "mkfs.ext4 -F -q",
-                expected_capability: FilesystemCapability::ExtentManipulation,
+                expected_capability: FilesystemCapability::Standard,
             },
         ];
         
@@ -2283,9 +1892,7 @@ mod tests {
             println!("▶ {} (capability: {:?})", fs.name.to_uppercase(), capability);
             
             // FICLONE test (CoW filesystems only)
-            if capability == FilesystemCapability::CopyOnWrite 
-                || capability == FilesystemCapability::ExtentManipulationWithReflink 
-            {
+            if capability == FilesystemCapability::CopyOnWrite {
                 use std::os::unix::io::AsRawFd;
                 
                 let backup_path = mnt_path.join("ficlone_backup.txt");

@@ -1,5 +1,7 @@
 
 
+
+
 #Ignore vscode AI rules
 .github/instructions/codacy.instructions.md
 
@@ -15,4 +17,5 @@ arch/pkg/
 arch/src/
 .venv/
 *-wikipedia.txt
-*-wikipedia.parquet*.bz2
+*.parquet
+*.bz2
