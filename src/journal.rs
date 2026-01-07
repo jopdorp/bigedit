@@ -299,11 +299,29 @@ pub fn delete_journal(file_path: &Path) -> Result<()> {
 }
 
 /// Compact: rewrite the file with all patches applied and delete journal
-/// This is the slow operation, but only done on explicit request
+/// 
+/// Uses fast in-place consolidation on ext4/XFS when possible (O(patches)),
+/// otherwise falls back to streaming rewrite (O(file_size)).
 pub fn compact(file_path: &Path, patches: &PatchList) -> Result<()> {
-    use crate::save::save_file;
+    use crate::save::{save_file, try_fast_consolidate};
 
-    // Full save to the file
+    // Try fast consolidation first (ext4/XFS extent operations)
+    match try_fast_consolidate(file_path, patches) {
+        Ok(true) => {
+            // Fast consolidation succeeded
+            delete_journal(file_path)?;
+            return Ok(());
+        }
+        Ok(false) => {
+            // Fast consolidation not available, fall through to streaming
+        }
+        Err(e) => {
+            // Log error but continue with fallback
+            eprintln!("[compact] Fast consolidation failed, using fallback: {}", e);
+        }
+    }
+
+    // Fallback: Full streaming save to the file
     save_file(file_path, patches, None)?;
 
     // Delete the journal

@@ -3,25 +3,18 @@
 //! This editor allows editing multi-GB text files without loading them entirely
 //! into memory. It uses a viewport + patch list + streaming save approach.
 
-mod editor;
-#[cfg(feature = "fuse")]
-mod fuse_view;
-mod journal;
-mod overlay;
-mod patches;
-mod save;
-mod search;
-mod types;
-mod ui;
-mod viewport;
+// Use modules from the library
+use bigedit::config::Config;
+use bigedit::ui::App;
 
 use anyhow::{Context, Result};
 use std::env;
 use std::path::PathBuf;
 
-use ui::App;
-
 fn main() -> Result<()> {
+    // Load configuration
+    let config = Config::load();
+    
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
@@ -62,10 +55,10 @@ fn main() -> Result<()> {
     };
 
     // Create and run the application
-    let mut app = App::new(&path)
+    let mut app = App::with_config(&path, config)
         .context("Failed to initialize editor")?;
     
-    // Enable vi mode if requested
+    // Enable vi mode if requested via command line (overrides config)
     if vi_mode {
         app.set_vi_mode();
     }

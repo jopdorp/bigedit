@@ -447,6 +447,10 @@ pub enum EditorMode {
     #[default]
     Normal,
     Search,
+    SearchBackward,
+    Replace,
+    ReplaceConfirm,
+    ReplaceQuery,
     Save,
     Help,
     Exit,

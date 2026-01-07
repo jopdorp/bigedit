@@ -13,3 +13,6 @@ arch/*.pkg.tar.zst
 arch/*.tar.gz
 arch/pkg/
 arch/src/
+.venv/
+*-wikipedia.txt
+*-wikipedia.parquet*.bz2

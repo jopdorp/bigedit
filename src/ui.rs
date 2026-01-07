@@ -2,13 +2,15 @@
 //!
 //! This module provides a nano-like interface using ratatui and crossterm.
 
+use crate::config::Config;
 use crate::editor::Editor;
 #[cfg(feature = "fuse")]
 use crate::fuse_view::FuseMount;
 use crate::journal;
 use crate::overlay::{SaveStrategy, OverlaySession, ReflinkSession};
 use crate::save::save_file;
-use crate::search::{find_first_in_buffer, streaming_search_forward};
+use crate::search::{find_first_in_buffer, find_last_in_buffer, streaming_search_forward, streaming_search_backward};
+use crate::search_service::{SearchService, SearchOptions, SearchDirection};
 use crate::types::{EditorMode, InputStyle, ViMode};
 use crate::viewport::display_width;
 
@@ -16,6 +18,8 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -126,11 +130,40 @@ pub struct App {
     /// Active FUSE mount (if using FuseView strategy)
     #[cfg(feature = "fuse")]
     fuse_mount: Option<FuseMount>,
+    /// Configuration
+    #[allow(dead_code)]
+    config: Config,
+    /// Search service for unified search
+    search_service: Option<SearchService>,
+    /// Background-built semantic index (swapped in when ready)
+    #[cfg(feature = "semantic-search")]
+    pending_index: Arc<Mutex<Option<crate::semantic::SemanticIndex>>>,
+    /// Background indexing thread handle
+    #[cfg(feature = "semantic-search")]
+    indexing_thread: Option<JoinHandle<()>>,
+    /// Indexing progress (0-100 percentage, or 101 = complete, 255 = error)
+    #[cfg(feature = "semantic-search")]
+    indexing_progress: Arc<std::sync::atomic::AtomicU8>,
+    /// Whether semantic index has been invalidated since last modification
+    /// Used to avoid repeated invalidation on every keystroke
+    #[cfg(feature = "semantic-search")]
+    index_invalidated: bool,
+    /// Replace query string
+    replace_query: String,
+    /// Last search direction
+    last_search_direction: SearchDirection,
+    /// Position of current match for replace
+    replace_position: Option<u64>,
 }
 
 impl App {
-    /// Create a new app with the given file
+    /// Create a new app with the given file and default config
     pub fn new(path: &Path) -> Result<Self> {
+        Self::with_config(path, Config::default())
+    }
+
+    /// Create a new app with the given file and config
+    pub fn with_config(path: &Path, config: Config) -> Result<Self> {
         // Set up terminal
         terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -156,11 +189,98 @@ impl App {
             Editor::new_file(path)?
         };
 
+        // Apply config settings
+        if config.editor.input_style == "vi" {
+            editor.input_style = InputStyle::Vi;
+            editor.vi_mode = ViMode::Normal;
+        }
+
         // Show detected strategy
         #[cfg(feature = "fuse")]
         editor.set_status(format!("Mode: {} | ^T=toggle mode, ^J=write to file", save_strategy.description()));
         #[cfg(not(feature = "fuse"))]
         editor.set_status("Mode: Journal | ^J=write to file (FUSE not available)");
+
+        // Initialize search service
+        let mut search_service = SearchService::new(path, config.fts_search.clone()).ok();
+        
+        // Try to load cached index immediately (fast if exists)
+        #[cfg(feature = "semantic-search")]
+        if let Some(ref mut svc) = search_service {
+            svc.try_load_cached_index();
+        }
+        
+        // If no cached index, spawn background thread to build it
+        #[cfg(feature = "semantic-search")]
+        let pending_index: Arc<Mutex<Option<crate::semantic::SemanticIndex>>> = Arc::new(Mutex::new(None));
+        
+        // Progress indicator: 0-100 = percentage, 101 = complete, 255 = error
+        #[cfg(feature = "semantic-search")]
+        let indexing_progress: Arc<std::sync::atomic::AtomicU8> = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        
+        #[cfg(feature = "semantic-search")]
+        let indexing_thread = if search_service.as_ref().map(|s| s.has_semantic_index()).unwrap_or(true) {
+            // Already have index (from cache) or no search service - no background work needed
+            indexing_progress.store(101, std::sync::atomic::Ordering::Relaxed); // Mark as complete
+            None
+        } else {
+            // Build index in background
+            let pending = Arc::clone(&pending_index);
+            let progress = Arc::clone(&indexing_progress);
+            let file_path = path.to_path_buf();
+            Some(std::thread::spawn(move || {
+                use crate::semantic::{SemanticIndex, FastEmbeddingModel};
+                use crate::config::SemanticSearchConfig;
+                use std::sync::atomic::Ordering;
+                
+                let start = std::time::Instant::now();
+                
+                // Load the embedding model
+                let model = match FastEmbeddingModel::load_default() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("[background] Failed to load model: {}", e);
+                        progress.store(255, Ordering::Relaxed); // Error
+                        return;
+                    }
+                };
+                
+                // Create index
+                let config = SemanticSearchConfig::default();
+                let mut index = match SemanticIndex::new(&file_path, config) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        eprintln!("[background] Failed to create index: {}", e);
+                        progress.store(255, Ordering::Relaxed); // Error
+                        return;
+                    }
+                };
+                
+                // Build the index using the standalone method
+                let progress_ref = Arc::clone(&progress);
+                if let Err(e) = index.build_from_file(&model, move |_chunks, _total, bytes, total_bytes| {
+                    let pct = (bytes as f64 / total_bytes as f64 * 100.0) as u8;
+                    progress_ref.store(pct.min(100), Ordering::Relaxed);
+                }) {
+                    eprintln!("[background] Failed to build index: {}", e);
+                    progress.store(255, Ordering::Relaxed); // Error
+                    return;
+                }
+                
+                // Save to disk cache
+                if let Err(e) = index.save_to_cache() {
+                    eprintln!("[background] Warning: Failed to save cache: {}", e);
+                }
+                
+                let _elapsed = start.elapsed();
+                progress.store(101, Ordering::Relaxed); // Complete
+                
+                // Store in pending_index for main thread to pick up
+                if let Ok(mut guard) = pending.lock() {
+                    *guard = Some(index);
+                }
+            }))
+        };
 
         Ok(Self {
             editor,
@@ -171,6 +291,19 @@ impl App {
             reflink_session: None,
             #[cfg(feature = "fuse")]
             fuse_mount: None,
+            config,
+            search_service,
+            #[cfg(feature = "semantic-search")]
+            pending_index,
+            #[cfg(feature = "semantic-search")]
+            indexing_thread,
+            #[cfg(feature = "semantic-search")]
+            indexing_progress,
+            #[cfg(feature = "semantic-search")]
+            index_invalidated: false,
+            replace_query: String::new(),
+            last_search_direction: SearchDirection::Forward,
+            replace_position: None,
         })
     }
 
@@ -184,11 +317,50 @@ impl App {
     /// Run the main event loop
     pub fn run(&mut self) -> Result<()> {
         while !self.should_quit {
+            // Check if background indexing completed
+            #[cfg(feature = "semantic-search")]
+            self.check_pending_index();
+            
+            // Check if file was modified and invalidate semantic index
+            #[cfg(feature = "semantic-search")]
+            self.check_index_invalidation();
+            
             self.ensure_cursor_visible();
             self.draw()?;
             self.handle_events()?;
         }
         Ok(())
+    }
+    
+    /// Check if file was modified and invalidate semantic index if needed
+    #[cfg(feature = "semantic-search")]
+    fn check_index_invalidation(&mut self) {
+        // If file is modified and we haven't invalidated yet, do it now
+        if self.editor.is_modified() && !self.index_invalidated {
+            if let Some(ref mut svc) = self.search_service {
+                svc.invalidate_semantic_index();
+            }
+            self.index_invalidated = true;
+        }
+        // Reset the flag when file is saved (no longer modified)
+        if !self.editor.is_modified() {
+            self.index_invalidated = false;
+        }
+    }
+    
+    /// Check if background indexing completed and pick up the index
+    #[cfg(feature = "semantic-search")]
+    fn check_pending_index(&mut self) {
+        // Try to get the pending index without blocking
+        if let Ok(mut guard) = self.pending_index.try_lock() {
+            if let Some(index) = guard.take() {
+                // Move the index into the search service
+                if let Some(ref mut svc) = self.search_service {
+                    svc.set_semantic_index(index);
+                    self.editor.set_status("Semantic index ready!");
+                }
+            }
+        }
     }
 
     /// Ensure cursor is visible by adjusting scroll_offset
@@ -213,6 +385,12 @@ impl App {
     fn draw(&mut self) -> Result<()> {
         let editor = &self.editor;
         let save_strategy = self.save_strategy;
+        
+        // Get indexing progress for status bar
+        #[cfg(feature = "semantic-search")]
+        let indexing_progress = self.indexing_progress.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "semantic-search"))]
+        let indexing_progress: u8 = 101; // Mark as complete when feature disabled
 
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -230,8 +408,8 @@ impl App {
             // Draw main text area
             draw_text_area(frame, editor, chunks[0]);
 
-            // Draw status bar
-            draw_status_bar(frame, editor, chunks[1]);
+            // Draw status bar with indexing progress
+            draw_status_bar(frame, editor, indexing_progress, chunks[1]);
 
             // Draw help/mode bar
             draw_help_bar(frame, editor, save_strategy, chunks[2]);
@@ -280,6 +458,10 @@ impl App {
                         }
                     }
                     EditorMode::Search => self.handle_search_mode(key)?,
+                    EditorMode::SearchBackward => self.handle_search_backward_mode(key)?,
+                    EditorMode::Replace => self.handle_replace_mode(key)?,
+                    EditorMode::ReplaceConfirm => self.handle_replace_confirm_mode(key)?,
+                    EditorMode::ReplaceQuery => self.handle_replace_query(key)?,
                     EditorMode::Save => self.handle_save_mode(key)?,
                     EditorMode::Help => self.handle_help_mode(key)?,
                     EditorMode::Exit => self.handle_exit_mode(key)?,
@@ -309,16 +491,46 @@ impl App {
                 self.save_file()?;
             }
 
-            // Search
+            // Search forward
             (KeyModifiers::CONTROL, KeyCode::Char('w')) => {
                 self.editor.mode = EditorMode::Search;
                 self.editor.input_buffer.clear();
+                self.last_search_direction = SearchDirection::Forward;
                 // Show previous search query as hint
                 if self.editor.search_query.is_empty() {
                     self.editor.set_status("Search: ");
                 } else {
                     self.editor.set_status(format!("Search (Enter for '{}'): ", self.editor.search_query));
                 }
+            }
+
+            // Search backward (Ctrl+Q)
+            (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
+                self.editor.mode = EditorMode::SearchBackward;
+                self.editor.input_buffer.clear();
+                self.last_search_direction = SearchDirection::Backward;
+                if self.editor.search_query.is_empty() {
+                    self.editor.set_status("Search backward: ");
+                } else {
+                    self.editor.set_status(format!("Search backward (Enter for '{}'): ", self.editor.search_query));
+                }
+            }
+
+            // Find and Replace (Ctrl+H, like nano's Ctrl+\)
+            (KeyModifiers::CONTROL, KeyCode::Char('h')) => {
+                self.editor.mode = EditorMode::Replace;
+                self.editor.input_buffer.clear();
+                self.editor.set_status("Search (to replace): ");
+            }
+
+            // Find next (F3)
+            (KeyModifiers::NONE, KeyCode::F(3)) => {
+                self.find_next()?;
+            }
+
+            // Find previous (Shift+F3)
+            (KeyModifiers::SHIFT, KeyCode::F(3)) => {
+                self.find_prev()?;
             }
 
             // Help
@@ -724,6 +936,7 @@ impl App {
                 // Only search if we have a query (either new or previous)
                 self.editor.mode = EditorMode::Normal;
                 if !self.editor.search_query.is_empty() {
+                    self.last_search_direction = SearchDirection::Forward;
                     self.find_next()?;
                 } else {
                     self.editor.set_status("No search pattern");
@@ -736,6 +949,101 @@ impl App {
             KeyCode::Char(c) => {
                 self.editor.input_buffer.push(c);
                 self.editor.set_status(format!("Search: {}", self.editor.input_buffer));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Handle keypress in backward search mode
+    fn handle_search_backward_mode(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.editor.mode = EditorMode::Normal;
+                self.editor.clear_status();
+            }
+            KeyCode::Enter => {
+                if !self.editor.input_buffer.is_empty() {
+                    self.editor.search_query = self.editor.input_buffer.clone();
+                }
+                self.editor.mode = EditorMode::Normal;
+                if !self.editor.search_query.is_empty() {
+                    self.last_search_direction = SearchDirection::Backward;
+                    self.find_prev()?;
+                } else {
+                    self.editor.set_status("No search pattern");
+                }
+            }
+            KeyCode::Backspace => {
+                self.editor.input_buffer.pop();
+                self.editor.set_status(format!("Search backward: {}", self.editor.input_buffer));
+            }
+            KeyCode::Char(c) => {
+                self.editor.input_buffer.push(c);
+                self.editor.set_status(format!("Search backward: {}", self.editor.input_buffer));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Handle keypress in replace mode (entering search pattern)
+    fn handle_replace_mode(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.editor.mode = EditorMode::Normal;
+                self.editor.clear_status();
+            }
+            KeyCode::Enter => {
+                if !self.editor.input_buffer.is_empty() {
+                    self.editor.search_query = self.editor.input_buffer.clone();
+                    self.editor.input_buffer.clear();
+                    self.editor.set_status(format!("Replace '{}' with: ", self.editor.search_query));
+                    self.editor.mode = EditorMode::ReplaceConfirm;
+                } else if !self.editor.search_query.is_empty() {
+                    self.editor.input_buffer.clear();
+                    self.editor.set_status(format!("Replace '{}' with: ", self.editor.search_query));
+                    self.editor.mode = EditorMode::ReplaceConfirm;
+                } else {
+                    self.editor.set_status("No search pattern");
+                    self.editor.mode = EditorMode::Normal;
+                }
+            }
+            KeyCode::Backspace => {
+                self.editor.input_buffer.pop();
+                self.editor.set_status(format!("Search (to replace): {}", self.editor.input_buffer));
+            }
+            KeyCode::Char(c) => {
+                self.editor.input_buffer.push(c);
+                self.editor.set_status(format!("Search (to replace): {}", self.editor.input_buffer));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Handle keypress in replace confirm mode (entering replacement text)
+    fn handle_replace_confirm_mode(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.editor.mode = EditorMode::Normal;
+                self.editor.clear_status();
+            }
+            KeyCode::Enter => {
+                self.replace_query = self.editor.input_buffer.clone();
+                self.editor.input_buffer.clear();
+                self.editor.mode = EditorMode::Normal;
+                
+                // Find first match and offer replace options
+                self.do_replace_interactive()?;
+            }
+            KeyCode::Backspace => {
+                self.editor.input_buffer.pop();
+                self.editor.set_status(format!("Replace '{}' with: {}", self.editor.search_query, self.editor.input_buffer));
+            }
+            KeyCode::Char(c) => {
+                self.editor.input_buffer.push(c);
+                self.editor.set_status(format!("Replace '{}' with: {}", self.editor.search_query, self.editor.input_buffer));
             }
             _ => {}
         }
@@ -1096,10 +1404,261 @@ impl App {
 
         Ok(())
     }
+
+    /// Find previous occurrence of search pattern (backward search)
+    fn find_prev(&mut self) -> Result<()> {
+        if self.editor.search_query.is_empty() {
+            self.editor.set_status("No search pattern");
+            return Ok(());
+        }
+
+        let pattern = self.editor.search_query.as_bytes();
+
+        // Get current cursor position in original file
+        let current_pos = self.editor.cursor_to_original_pos().unwrap_or(0);
+        
+        if current_pos == 0 {
+            self.editor.set_status("Already at beginning");
+            return Ok(());
+        }
+
+        // First try to find in current viewport (before cursor)
+        let render_pos = self
+            .editor
+            .viewport
+            .row_col_to_render_byte(self.editor.cursor.row, self.editor.cursor.col)
+            .unwrap_or(0);
+
+        // Search in viewport before cursor
+        if render_pos > 0 {
+            let search_area = &self.editor.viewport.render_bytes[..render_pos];
+            if let Some(offset) = find_last_in_buffer(search_area, pattern) {
+                if let Some((row, col)) = self.editor.viewport.render_byte_to_row_col(offset) {
+                    self.editor.cursor.row = row;
+                    self.editor.cursor.col = col;
+                    self.editor.set_status(format!("Found at offset {}", offset));
+                    return Ok(());
+                }
+            }
+        }
+
+        // Not found in viewport, do streaming search backward
+        let mut file = File::open(&self.editor.path)?;
+        
+        if let Some(result) = streaming_search_backward(
+            &mut file,
+            self.editor.file_length,
+            current_pos,
+            pattern,
+            &self.editor.patches,
+            false,
+        )? {
+            // Found - reload viewport at that position
+            let new_start = result.position.saturating_sub(1024);
+            self.editor.reload_viewport(new_start)?;
+
+            // Position cursor at match
+            let offset_in_viewport = (result.position - new_start) as usize;
+            if let Some((row, col)) = self.editor.viewport.render_byte_to_row_col(offset_in_viewport)
+            {
+                self.editor.cursor.row = row;
+                self.editor.cursor.col = col;
+            }
+
+            self.editor.set_status(format!(
+                "Found at byte {}",
+                result.position
+            ));
+        } else {
+            self.editor.set_status("Pattern not found");
+        }
+
+        Ok(())
+    }
+
+    /// Interactive find and replace
+    fn do_replace_interactive(&mut self) -> Result<()> {
+        if self.editor.search_query.is_empty() {
+            self.editor.set_status("No search pattern");
+            return Ok(());
+        }
+
+        // First find the next match
+        let pattern = self.editor.search_query.as_bytes();
+        let current_pos = self.editor.cursor_to_original_pos().unwrap_or(0);
+
+        // Try to find in viewport first
+        let render_pos = self
+            .editor
+            .viewport
+            .row_col_to_render_byte(self.editor.cursor.row, self.editor.cursor.col)
+            .unwrap_or(0);
+
+        let search_from = render_pos;
+        let remaining = &self.editor.viewport.render_bytes[search_from.min(self.editor.viewport.render_bytes.len())..];
+
+        let found_pos = if let Some(offset) = find_first_in_buffer(remaining, pattern) {
+            // Found in viewport
+            let byte_pos = search_from + offset;
+            if let Some((row, col)) = self.editor.viewport.render_byte_to_row_col(byte_pos) {
+                self.editor.cursor.row = row;
+                self.editor.cursor.col = col;
+            }
+            Some(current_pos + offset as u64)
+        } else {
+            // Do streaming search
+            let mut file = File::open(&self.editor.path)?;
+            if let Some(result) = streaming_search_forward(
+                &mut file,
+                self.editor.file_length,
+                current_pos,
+                pattern,
+                &self.editor.patches,
+                false,
+            )? {
+                // Found - reload viewport at that position
+                let new_start = result.position.saturating_sub(1024);
+                self.editor.reload_viewport(new_start)?;
+
+                let offset_in_viewport = (result.position - new_start) as usize;
+                if let Some((row, col)) = self.editor.viewport.render_byte_to_row_col(offset_in_viewport)
+                {
+                    self.editor.cursor.row = row;
+                    self.editor.cursor.col = col;
+                }
+                Some(result.position)
+            } else {
+                None
+            }
+        };
+
+        if let Some(pos) = found_pos {
+            // Show replace prompt
+            self.editor.set_status(format!(
+                "Found at byte {} | (y)es, (n)o skip, (a)ll, (q)uit: ",
+                pos
+            ));
+            self.editor.mode = EditorMode::ReplaceQuery;
+            self.replace_position = Some(pos);
+        } else {
+            self.editor.set_status("Pattern not found");
+        }
+
+        Ok(())
+    }
+
+    /// Handle replace query response
+    fn handle_replace_query(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                // Replace this occurrence
+                if let Some(pos) = self.replace_position {
+                    self.do_single_replace(pos)?;
+                    // Find next
+                    self.do_replace_interactive()?;
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                // Skip to next
+                self.find_next()?;
+                if self.editor.search_query.is_empty() {
+                    self.editor.mode = EditorMode::Normal;
+                } else {
+                    self.do_replace_interactive()?;
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                // Replace all
+                self.do_replace_all()?;
+                self.editor.mode = EditorMode::Normal;
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                // Quit replace mode
+                self.editor.mode = EditorMode::Normal;
+                self.editor.clear_status();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Perform a single replacement at the given position
+    fn do_single_replace(&mut self, pos: u64) -> Result<()> {
+        let search_bytes = self.editor.search_query.as_bytes();
+        let replace_bytes = self.replace_query.as_bytes();
+
+        // Create a patch for this replacement
+        let end_pos = pos + search_bytes.len() as u64;
+        self.editor.patches.replace(pos, end_pos, replace_bytes);
+
+        self.editor.modified = true;
+        self.editor.set_status(format!(
+            "Replaced at byte {} | '{}' -> '{}'",
+            pos, self.editor.search_query, self.replace_query
+        ));
+
+        // Refresh viewport to show the change
+        self.editor.refresh_viewport()?;
+
+        Ok(())
+    }
+
+    /// Replace all occurrences
+    fn do_replace_all(&mut self) -> Result<()> {
+        let pattern = self.editor.search_query.as_bytes();
+        let replace_bytes = self.replace_query.as_bytes();
+
+        // Start from beginning
+        let mut file = File::open(&self.editor.path)?;
+        let mut count = 0u64;
+        let mut search_pos = 0u64;
+
+        // Find all occurrences
+        while let Some(result) = streaming_search_forward(
+            &mut file,
+            self.editor.file_length,
+            search_pos,
+            pattern,
+            &self.editor.patches,
+            false,
+        )? {
+            // Add patch for this replacement
+            let end_pos = result.position + pattern.len() as u64;
+            self.editor.patches.replace(result.position, end_pos, replace_bytes);
+            count += 1;
+            
+            // Move past this match
+            search_pos = result.position + pattern.len() as u64;
+        }
+
+        if count > 0 {
+            self.editor.modified = true;
+            self.editor.refresh_viewport()?;
+            self.editor.set_status(format!(
+                "Replaced {} occurrence{} of '{}' with '{}'",
+                count,
+                if count == 1 { "" } else { "s" },
+                self.editor.search_query,
+                self.replace_query
+            ));
+        } else {
+            self.editor.set_status("No occurrences found");
+        }
+
+        Ok(())
+    }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
+        // Wait for background indexing thread to finish
+        #[cfg(feature = "semantic-search")]
+        if let Some(handle) = self.indexing_thread.take() {
+            // Give it a short time to finish, don't block forever
+            // We use a separate thread with timeout since JoinHandle has no timeout
+            let _ = handle.join();
+        }
+        
         // Restore terminal
         let _ = terminal::disable_raw_mode();
         let _ = self.terminal.backend_mut().execute(LeaveAlternateScreen);
@@ -1158,7 +1717,8 @@ fn draw_text_area(frame: &mut ratatui::Frame, editor: &Editor, area: Rect) {
 }
 
 /// Draw the status bar
-fn draw_status_bar(frame: &mut ratatui::Frame, editor: &Editor, area: Rect) {
+/// indexing_progress: 0-100 = percentage, 101 = complete, 255 = error
+fn draw_status_bar(frame: &mut ratatui::Frame, editor: &Editor, indexing_progress: u8, area: Rect) {
     let filename = editor
         .path
         .file_name()
@@ -1173,11 +1733,19 @@ fn draw_status_bar(frame: &mut ratatui::Frame, editor: &Editor, area: Rect) {
         editor.cursor.col + 1,
         editor.cursor_byte_position()
     );
+    
+    // Indexing progress indicator
+    let indexing_info = match indexing_progress {
+        0..=100 => format!(" [Indexing {}%]", indexing_progress),
+        101 => String::new(), // Complete - no indicator
+        _ => " [Index Error]".to_string(),
+    };
 
     let file_info = format!(
-        "{}{} | {} bytes",
+        "{}{}{} | {} bytes",
         filename,
         modified_marker,
+        indexing_info,
         editor.file_length
     );
 

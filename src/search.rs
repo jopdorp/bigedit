@@ -76,6 +76,16 @@ pub fn find_first_case_insensitive(buffer: &[u8], pattern: &[u8]) -> Option<usiz
     finder.find(&buffer_lower)
 }
 
+/// Find the last match in a buffer (reverse search)
+pub fn find_last_in_buffer(buffer: &[u8], pattern: &[u8]) -> Option<usize> {
+    if pattern.is_empty() || buffer.len() < pattern.len() {
+        return None;
+    }
+
+    let finder = memmem::FinderRev::new(pattern);
+    finder.rfind(buffer)
+}
+
 /// Streaming forward search through a file
 ///
 /// Searches from `start_pos` forward, applying patches as needed.
