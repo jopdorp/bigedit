@@ -344,7 +344,11 @@ pub enum FilesystemCapability {
     ExtentManipulation,
     /// XFS: supports BOTH reflink AND INSERT_RANGE/COLLAPSE_RANGE (best of both worlds)
     ExtentManipulationWithReflink,
-    /// btrfs/ZFS/APFS: supports reflinks/clonefile (CoW) but no extent manipulation
+    /// btrfs: supports FICLONE + BTRFS_IOC_CLONE_RANGE for partial cloning
+    BtrfsCloneRange,
+    /// ZFS: supports FICLONE + copy_file_range block cloning (OpenZFS 2.2+)
+    ZfsBlockClone,
+    /// APFS/other CoW: supports reflinks/clonefile but no partial cloning
     CopyOnWrite,
     /// No special capabilities, use streaming rewrite
     Standard,
@@ -364,8 +368,10 @@ pub fn detect_filesystem_capability(path: &Path) -> FilesystemCapability {
                 // XFS supports BOTH FICLONE (reflink) AND INSERT_RANGE/COLLAPSE_RANGE
                 // Best of both worlds: instant backup + O(patches) consolidation
                 "xfs" => return FilesystemCapability::ExtentManipulationWithReflink,
-                // btrfs and ZFS support reflink but not INSERT_RANGE
-                "btrfs" | "zfs" => return FilesystemCapability::CopyOnWrite,
+                // btrfs supports BTRFS_IOC_CLONE_RANGE for partial file cloning
+                "btrfs" => return FilesystemCapability::BtrfsCloneRange,
+                // ZFS 2.2+ supports copy_file_range with block cloning
+                "zfs" => return FilesystemCapability::ZfsBlockClone,
                 _ => {}
             }
         }
@@ -601,8 +607,36 @@ impl BackgroundConsolidator {
                     // XFS: Best of both worlds
                     success = try_reflink_extent_consolidate_linux(path, patches)?;
                 }
+                FilesystemCapability::BtrfsCloneRange => {
+                    // btrfs: CLONE_RANGE for O(patches) partial cloning
+                    match try_btrfs_clone_range_consolidate(path, patches) {
+                        Ok(true) => success = true,
+                        Ok(false) => {} // Fall through
+                        Err(e) => {
+                            eprintln!("[btrfs] CLONE_RANGE consolidation failed: {}", e);
+                        }
+                    }
+                    // Fall back to FICLONE + streaming if CLONE_RANGE failed
+                    if !success {
+                        success = try_reflink_consolidate_linux(path, patches)?;
+                    }
+                }
+                FilesystemCapability::ZfsBlockClone => {
+                    // ZFS: copy_file_range for O(patches) block cloning
+                    match try_zfs_block_clone_consolidate(path, patches) {
+                        Ok(true) => success = true,
+                        Ok(false) => {} // Fall through
+                        Err(e) => {
+                            eprintln!("[zfs] Block clone consolidation failed: {}", e);
+                        }
+                    }
+                    // Fall back to FICLONE + streaming if block clone failed
+                    if !success {
+                        success = try_reflink_consolidate_linux(path, patches)?;
+                    }
+                }
                 FilesystemCapability::CopyOnWrite => {
-                    // btrfs/ZFS: FICLONE backup + streaming
+                    // APFS/other: FICLONE backup + streaming
                     success = try_reflink_consolidate_linux(path, patches)?;
                 }
                 FilesystemCapability::ExtentManipulation => {
@@ -642,8 +676,10 @@ impl Default for BackgroundConsolidator {
 /// **SAFETY**: This function NEVER modifies the original file in-place without backup.
 /// It always uses one of these safe strategies:
 /// 1. XFS: FICLONE backup + INSERT_RANGE/COLLAPSE_RANGE + cleanup (best of both worlds)
-/// 2. btrfs/ZFS/APFS: FICLONE backup + streaming rewrite + cleanup
-/// 3. ext4/Standard: streaming rewrite (temp file + atomic rename) - crash-safe
+/// 2. btrfs: BTRFS_IOC_CLONE_RANGE for partial cloning + atomic rename
+/// 3. ZFS: copy_file_range block cloning (OpenZFS 2.2+) + atomic rename  
+/// 4. APFS: FICLONE backup + streaming rewrite + cleanup
+/// 5. ext4/Standard: streaming rewrite (temp file + atomic rename) - crash-safe
 /// 
 /// Returns Ok(true) if fast consolidation was used, Ok(false) if caller should
 /// fall back to streaming rewrite.
@@ -664,12 +700,38 @@ pub fn try_fast_consolidate(path: &Path, patches: &PatchList) -> Result<bool> {
                 }
             }
         }
+        FilesystemCapability::BtrfsCloneRange => {
+            // btrfs: Use BTRFS_IOC_CLONE_RANGE for O(patches) partial cloning
+            #[cfg(target_os = "linux")]
+            {
+                match try_btrfs_clone_range_consolidate(path, patches) {
+                    Ok(true) => return Ok(true),
+                    Ok(false) => {} // Fall through to streaming
+                    Err(e) => {
+                        eprintln!("[btrfs] CLONE_RANGE failed, falling back: {}", e);
+                    }
+                }
+            }
+        }
+        FilesystemCapability::ZfsBlockClone => {
+            // ZFS: Use copy_file_range for O(patches) block cloning
+            #[cfg(target_os = "linux")]
+            {
+                match try_zfs_block_clone_consolidate(path, patches) {
+                    Ok(true) => return Ok(true),
+                    Ok(false) => {} // Fall through to streaming
+                    Err(e) => {
+                        eprintln!("[zfs] Block clone failed, falling back: {}", e);
+                    }
+                }
+            }
+        }
         FilesystemCapability::ExtentManipulation => {
             // ext4: No FICLONE backup, fall through to streaming (crash-safe)
             // INSERT_RANGE is NOT crash-safe without backup
         }
         FilesystemCapability::CopyOnWrite => {
-            // btrfs/ZFS: FICLONE backup + streaming rewrite
+            // APFS/other: FICLONE backup + streaming rewrite
             // Handled by smart_consolidate, fall through
         }
         FilesystemCapability::Standard => {}
@@ -923,6 +985,376 @@ fn try_reflink_extent_consolidate_linux(path: &Path, patches: &PatchList) -> Res
 }
 
 // =============================================================================
+// btrfs Clone Range Operations
+// =============================================================================
+//
+// btrfs supports BTRFS_IOC_CLONE_RANGE which can clone specific byte ranges
+// between files. Unlike INSERT_RANGE, this works at arbitrary offsets but
+// still requires sector alignment (typically 4K).
+//
+// Strategy for block-aligned edits:
+// 1. Create a new temp file
+// 2. Use CLONE_RANGE to copy unchanged regions from original
+// 3. Write the modified data directly
+// 4. Atomic rename temp -> original
+//
+// This is O(patches) for the clone operations, but each patch region
+// still needs to be written. Best for large files with few, large edits.
+
+/// btrfs clone range argument structure (from linux/btrfs.h)
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct BtrfsIoctlCloneRangeArgs {
+    src_fd: i64,
+    src_offset: u64,
+    src_length: u64,
+    dest_offset: u64,
+}
+
+/// BTRFS_IOC_CLONE_RANGE ioctl number
+#[cfg(target_os = "linux")]
+const BTRFS_IOC_CLONE_RANGE: libc::c_ulong = 0x4020940D;
+
+/// btrfs: Use CLONE_RANGE for O(patches) consolidation
+/// 
+/// This clones unchanged regions from the original file to a new file,
+/// then writes the modified data. Works with sector-aligned boundaries.
+/// 
+/// Returns Ok(true) if successful, Ok(false) to fall back to streaming.
+#[cfg(target_os = "linux")]
+fn try_btrfs_clone_range_consolidate(path: &Path, patches: &PatchList) -> Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    
+    let sorted_patches = patches.patches();
+    if sorted_patches.is_empty() {
+        return Ok(true);
+    }
+    
+    // Check if we're on btrfs
+    if let Some(fstype) = get_filesystem_type_linux(path) {
+        if fstype != "btrfs" {
+            return Ok(false);
+        }
+    } else {
+        return Ok(false);
+    }
+    
+    // Get original file size
+    let original_size = std::fs::metadata(path)?.len();
+    
+    // Create temp file for the new version
+    let temp_path = path.with_extension("bigedit-clone-temp");
+    let _ = std::fs::remove_file(&temp_path);
+    
+    let result = (|| -> Result<()> {
+        let src = File::open(path).context("Failed to open source for CLONE_RANGE")?;
+        let dst = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp_path)
+            .context("Failed to create temp file")?;
+        
+        let src_fd = src.as_raw_fd();
+        let dst_fd = dst.as_raw_fd();
+        
+        // Calculate the new file size
+        let mut size_delta: i64 = 0;
+        for patch in sorted_patches {
+            let old_len = (patch.end - patch.start) as i64;
+            let new_len = patch.replacement.len() as i64;
+            size_delta += new_len - old_len;
+        }
+        let new_size = (original_size as i64 + size_delta) as u64;
+        
+        // Pre-allocate the destination file
+        dst.set_len(new_size)?;
+        
+        // Build a list of regions to clone vs write
+        // Clone unchanged regions, write patch data
+        let mut current_src_offset: u64 = 0;
+        let mut current_dst_offset: u64 = 0;
+        
+        for patch in sorted_patches {
+            // Clone the unchanged region before this patch
+            if patch.start > current_src_offset {
+                let clone_len = patch.start - current_src_offset;
+                
+                // Align to sector boundary (4K)
+                let aligned_len = (clone_len / BLOCK_SIZE) * BLOCK_SIZE;
+                
+                if aligned_len > 0 {
+                    let args = BtrfsIoctlCloneRangeArgs {
+                        src_fd: src_fd as i64,
+                        src_offset: current_src_offset,
+                        src_length: aligned_len,
+                        dest_offset: current_dst_offset,
+                    };
+                    
+                    let result = unsafe {
+                        libc::ioctl(dst_fd, BTRFS_IOC_CLONE_RANGE, &args as *const _)
+                    };
+                    
+                    if result != 0 {
+                        // CLONE_RANGE failed, fall back
+                        bail!("BTRFS_IOC_CLONE_RANGE failed: {}", std::io::Error::last_os_error());
+                    }
+                }
+                
+                // Handle any unaligned remainder by copying
+                let remainder = clone_len - aligned_len;
+                if remainder > 0 {
+                    use std::os::unix::fs::FileExt;
+                    let mut buf = vec![0u8; remainder as usize];
+                    src.read_at(&mut buf, current_src_offset + aligned_len)?;
+                    dst.write_at(&buf, current_dst_offset + aligned_len)?;
+                }
+                
+                current_dst_offset += clone_len;
+            }
+            
+            // Write the patch data
+            if !patch.replacement.is_empty() {
+                use std::os::unix::fs::FileExt;
+                dst.write_at(&patch.replacement, current_dst_offset)?;
+            }
+            current_dst_offset += patch.replacement.len() as u64;
+            current_src_offset = patch.end;
+        }
+        
+        // Clone/copy the remaining unchanged region after last patch
+        if current_src_offset < original_size {
+            let remaining_len = original_size - current_src_offset;
+            let aligned_len = (remaining_len / BLOCK_SIZE) * BLOCK_SIZE;
+            
+            if aligned_len > 0 {
+                let args = BtrfsIoctlCloneRangeArgs {
+                    src_fd: src_fd as i64,
+                    src_offset: current_src_offset,
+                    src_length: aligned_len,
+                    dest_offset: current_dst_offset,
+                };
+                
+                let result = unsafe {
+                    libc::ioctl(dst_fd, BTRFS_IOC_CLONE_RANGE, &args as *const _)
+                };
+                
+                if result != 0 {
+                    bail!("BTRFS_IOC_CLONE_RANGE (tail) failed: {}", std::io::Error::last_os_error());
+                }
+            }
+            
+            // Handle unaligned remainder
+            let remainder = remaining_len - aligned_len;
+            if remainder > 0 {
+                use std::os::unix::fs::FileExt;
+                let mut buf = vec![0u8; remainder as usize];
+                src.read_at(&mut buf, current_src_offset + aligned_len)?;
+                dst.write_at(&buf, current_dst_offset + aligned_len)?;
+            }
+        }
+        
+        dst.sync_all()?;
+        Ok(())
+    })();
+    
+    match result {
+        Ok(()) => {
+            // Success - atomic rename
+            std::fs::rename(&temp_path, path)?;
+            Ok(true)
+        }
+        Err(e) => {
+            // Failed - clean up temp file
+            let _ = std::fs::remove_file(&temp_path);
+            Err(e)
+        }
+    }
+}
+
+// =============================================================================
+// ZFS Block Cloning (OpenZFS 2.2+)
+// =============================================================================
+//
+// ZFS added block cloning in OpenZFS 2.2 (2023). It uses the same FICLONE
+// ioctl as btrfs/XFS for full-file cloning, and copy_file_range() for
+// partial clones.
+//
+// For consolidation, we can use copy_file_range() which ZFS implements
+// as block cloning when source and dest are on the same pool.
+//
+// Strategy:
+// 1. Create temp file on same ZFS dataset
+// 2. Use copy_file_range() to clone unchanged regions (ZFS does block cloning)
+// 3. Write modified data directly
+// 4. Atomic rename
+//
+// Note: Requires OpenZFS 2.2+ with block_cloning feature enabled
+
+/// ZFS: Use copy_file_range for O(patches) consolidation via block cloning
+/// 
+/// On ZFS 2.2+, copy_file_range() is implemented as block cloning when
+/// source and dest are on the same dataset, making it O(1) per range.
+/// 
+/// Returns Ok(true) if successful, Ok(false) to fall back to streaming.
+#[cfg(target_os = "linux")]
+fn try_zfs_block_clone_consolidate(path: &Path, patches: &PatchList) -> Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    
+    let sorted_patches = patches.patches();
+    if sorted_patches.is_empty() {
+        return Ok(true);
+    }
+    
+    // Check if we're on ZFS
+    if let Some(fstype) = get_filesystem_type_linux(path) {
+        if fstype != "zfs" {
+            return Ok(false);
+        }
+    } else {
+        return Ok(false);
+    }
+    
+    // Get original file size
+    let original_size = std::fs::metadata(path)?.len();
+    
+    // Create temp file for the new version
+    let temp_path = path.with_extension("bigedit-zfs-temp");
+    let _ = std::fs::remove_file(&temp_path);
+    
+    let result = (|| -> Result<()> {
+        let src = File::open(path).context("Failed to open source for copy_file_range")?;
+        let dst = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp_path)
+            .context("Failed to create temp file")?;
+        
+        let src_fd = src.as_raw_fd();
+        let dst_fd = dst.as_raw_fd();
+        
+        // Calculate the new file size
+        let mut size_delta: i64 = 0;
+        for patch in sorted_patches {
+            let old_len = (patch.end - patch.start) as i64;
+            let new_len = patch.replacement.len() as i64;
+            size_delta += new_len - old_len;
+        }
+        let new_size = (original_size as i64 + size_delta) as u64;
+        
+        // Pre-allocate the destination file
+        dst.set_len(new_size)?;
+        
+        // Build regions to clone vs write
+        let mut current_src_offset: u64 = 0;
+        let mut current_dst_offset: u64 = 0;
+        
+        for patch in sorted_patches {
+            // Clone the unchanged region before this patch using copy_file_range
+            if patch.start > current_src_offset {
+                let clone_len = patch.start - current_src_offset;
+                
+                let mut src_off = current_src_offset as i64;
+                let mut dst_off = current_dst_offset as i64;
+                let mut remaining = clone_len as usize;
+                
+                while remaining > 0 {
+                    let copied = unsafe {
+                        libc::copy_file_range(
+                            src_fd,
+                            &mut src_off as *mut i64,
+                            dst_fd,
+                            &mut dst_off as *mut i64,
+                            remaining,
+                            0, // flags
+                        )
+                    };
+                    
+                    if copied < 0 {
+                        let err = std::io::Error::last_os_error();
+                        // EXDEV means cross-device, not supported
+                        // ENOSYS means not implemented
+                        if err.raw_os_error() == Some(libc::EXDEV) || 
+                           err.raw_os_error() == Some(libc::ENOSYS) {
+                            // Fall back to streaming
+                            bail!("copy_file_range not supported: {}", err);
+                        }
+                        bail!("copy_file_range failed: {}", err);
+                    }
+                    
+                    if copied == 0 {
+                        break; // EOF
+                    }
+                    
+                    remaining -= copied as usize;
+                }
+                
+                current_dst_offset += clone_len;
+            }
+            
+            // Write the patch data
+            if !patch.replacement.is_empty() {
+                use std::os::unix::fs::FileExt;
+                dst.write_at(&patch.replacement, current_dst_offset)?;
+            }
+            current_dst_offset += patch.replacement.len() as u64;
+            current_src_offset = patch.end;
+        }
+        
+        // Clone the remaining unchanged region after last patch
+        if current_src_offset < original_size {
+            let clone_len = original_size - current_src_offset;
+            
+            let mut src_off = current_src_offset as i64;
+            let mut dst_off = current_dst_offset as i64;
+            let mut remaining = clone_len as usize;
+            
+            while remaining > 0 {
+                let copied = unsafe {
+                    libc::copy_file_range(
+                        src_fd,
+                        &mut src_off as *mut i64,
+                        dst_fd,
+                        &mut dst_off as *mut i64,
+                        remaining,
+                        0,
+                    )
+                };
+                
+                if copied < 0 {
+                    bail!("copy_file_range (tail) failed: {}", std::io::Error::last_os_error());
+                }
+                
+                if copied == 0 {
+                    break;
+                }
+                
+                remaining -= copied as usize;
+            }
+        }
+        
+        dst.sync_all()?;
+        Ok(())
+    })();
+    
+    match result {
+        Ok(()) => {
+            // Success - atomic rename
+            std::fs::rename(&temp_path, path)?;
+            Ok(true)
+        }
+        Err(e) => {
+            // Failed - clean up temp file
+            let _ = std::fs::remove_file(&temp_path);
+            Err(e)
+        }
+    }
+}
+
+// =============================================================================
 // Smart Consolidation Strategy
 // =============================================================================
 
@@ -1016,12 +1448,31 @@ pub fn choose_consolidation_strategy(
     // Still O(file_size) but with CoW benefits for unchanged regions
     let cow_time_ms = stream_time_ms; // Conservative estimate
     
+    // For btrfs/ZFS clone range, it's O(patches) for the cloning part
+    let clone_range_time_ms = patch_count as u64 * EXTENT_OP_TIME_MS;
+    
     let (strategy, time_ms) = match capability {
         FilesystemCapability::ExtentManipulationWithReflink => {
             // XFS: Best of both worlds - FICLONE backup + extent ops
             // Time = backup (instant) + extent ops
             if extent_time_ms < stream_time_ms {
                 (ConsolidationStrategy::ExtentOperations, extent_time_ms)
+            } else {
+                (ConsolidationStrategy::CloneAndModify, cow_time_ms)
+            }
+        }
+        FilesystemCapability::BtrfsCloneRange => {
+            // btrfs: CLONE_RANGE for O(patches) partial cloning
+            if clone_range_time_ms < stream_time_ms {
+                (ConsolidationStrategy::ExtentOperations, clone_range_time_ms)
+            } else {
+                (ConsolidationStrategy::CloneAndModify, cow_time_ms)
+            }
+        }
+        FilesystemCapability::ZfsBlockClone => {
+            // ZFS: copy_file_range for O(patches) block cloning
+            if clone_range_time_ms < stream_time_ms {
+                (ConsolidationStrategy::ExtentOperations, clone_range_time_ms)
             } else {
                 (ConsolidationStrategy::CloneAndModify, cow_time_ms)
             }
@@ -1035,7 +1486,7 @@ pub fn choose_consolidation_strategy(
             }
         }
         FilesystemCapability::CopyOnWrite => {
-            // btrfs/ZFS/APFS: Use clone+modify
+            // APFS/other: Use clone+modify
             (ConsolidationStrategy::CloneAndModify, cow_time_ms)
         }
         FilesystemCapability::Standard => {
